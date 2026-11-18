@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Check indexed content so partial staging cannot hide a formatting or lint failure.
+set -euo pipefail
+# shellcheck source=.githooks/lib/helpers.sh
+. "${HOOK_HELPERS:?run through the repository pre-commit hook}"
+readonly check_timeout=60
+root=$(git rev-parse --show-toplevel)
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/agy-staged.XXXXXX")
+cleanup() {
+	# Only this run's indexed copy is temporary; guard the name before removal.
+	if [[ -d "$scratch" && "${scratch##*/}" == agy-staged.* ]]; then
+		rm -r -- "$scratch"
+	fi
+}
+trap cleanup EXIT
+# Reject symlinks before extraction so a staged file cannot redirect a scanner outside this copy.
+staged_git ls-files --stage >"$scratch/index-modes"
+if grep -q '^120000 ' "$scratch/index-modes"; then
+	printf 'Staged verification refuses symlinks.\n' >&2
+	exit 1
+fi
+staged_git checkout-index --all --prefix="$scratch/"
+[[ -x "$root/node_modules/.bin/biome" ]] || {
+	printf 'Missing local Biome; run npm ci --ignore-scripts.\n' >&2
+	exit 1
+}
+# The scratch copy has no .git, so VCS ignore handling is off and biome.json excludes are used.
+run_step 'staged format and lint' "$check_timeout" "$root/node_modules/.bin/biome" check --vcs-enabled=false --error-on-warnings --config-path="$scratch/biome.json" "$scratch"

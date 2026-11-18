@@ -1,0 +1,7 @@
+// Repository Markdown rules on top of the shared hook base.
+{
+  "extends": ".githooks/lib/markdownlint.jsonc",
+  // The bb marketplace forbids a top-level `#` heading in PLUGIN_OVERVIEW.md
+  // because the store renders its own Overview title above the file.
+  "MD041": false
+}

@@ -1,0 +1,9 @@
+# Build output from `bb plugin build .`; consumers rebuild locally.
+dist/
+# Restored from package-lock.json with `npm ci --ignore-scripts`.
+node_modules/
+# Local secrets must never reach a public repository.
+.env
+.env.*
+# OS noise.
+.DS_Store

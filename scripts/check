@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# One fail-closed entry point keeps local validation and push validation identical.
+set -euo pipefail
+readonly local_timeout=120
+readonly network_timeout=180
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+# shellcheck source=.githooks/lib/helpers.sh
+. "$root/.githooks/lib/helpers.sh"
+# Only disposable at_sha worktrees need installation; never replace a clone's dependencies.
+if [[ ! -d node_modules ]]; then
+	run_step 'locked dependencies' "$network_timeout" npm ci --ignore-scripts
+fi
+run_step 'format and lint' "$local_timeout" npm run lint
+run_step 'typecheck' "$local_timeout" npm run typecheck
+run_step 'duplication' "$local_timeout" npm run duplicates
+run_step 'dependency audit' "$network_timeout" npm audit
+run_step 'build' "$local_timeout" npm run build
+run_step 'shell analysis' "$local_timeout" shellcheck -x scripts/setup-hooks scripts/check .githooks/pre-commit.d/* .githooks/pre-push.d/*
+run_step 'shell format' "$local_timeout" shfmt -d scripts/check .githooks/pre-commit.d .githooks/pre-push.d
+run_step 'markdown' "$local_timeout" markdownlint-cli2 README.md PLUGIN_OVERVIEW.md AGENTS.md
+# The smoke parses fixtures offline and reads live quota when `agy` is signed in.
+run_step 'usage smoke' "$local_timeout" npm run smoke
+printf 'All project checks passed.\n'

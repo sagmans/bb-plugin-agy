@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Verify each distinct pushed tip once; shared policy already checks every outgoing commit.
+set -euo pipefail
+# shellcheck source=.githooks/lib/helpers.sh
+. "${HOOK_HELPERS:?run through the repository pre-push hook}"
+pushed_shas <"${HOOK_STDIN_FILE:?missing push ref lines}" >/dev/null
+readonly check_timeout=600
+tips=' '
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+	[[ -n "$local_sha" ]] || continue
+	is_null_oid "$local_sha" && continue
+	tip=$(git rev-parse --verify "${local_sha}^{commit}")
+	case "$tips" in *" $tip "*) continue ;; esac
+	tips+="$tip "
+	run_step "project tip checks" "$check_timeout" at_sha "$tip" bash scripts/check
+done <"$HOOK_STDIN_FILE"
