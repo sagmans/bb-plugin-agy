@@ -18,7 +18,7 @@ The plugin id and the provider id are both `agy`. This id is different from the
 ## Install
 
 ```sh
-git clone https://github.com/assagman/bb-plugin-agy.git
+git clone https://github.com/sagmans/bb-plugin-agy.git
 cd bb-plugin-agy
 npm ci --ignore-scripts
 bb plugin build .

@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/assagman/bb-plugin-agy.git"
+    "url": "git+https://github.com/sagmans/bb-plugin-agy.git"
   },
-  "homepage": "https://github.com/assagman/bb-plugin-agy#readme",
+  "homepage": "https://github.com/sagmans/bb-plugin-agy#readme",
   "bugs": {
-    "url": "https://github.com/assagman/bb-plugin-agy/issues"
+    "url": "https://github.com/sagmans/bb-plugin-agy/issues"
   },
   "keywords": [
     "bb",
