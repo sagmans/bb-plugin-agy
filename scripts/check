@@ -18,7 +18,7 @@ run_step 'dependency audit' "$network_timeout" npm audit
 run_step 'build' "$local_timeout" npm run build
 run_step 'shell analysis' "$local_timeout" shellcheck -x scripts/setup-hooks scripts/check .githooks/pre-commit.d/* .githooks/pre-push.d/*
 run_step 'shell format' "$local_timeout" shfmt -d scripts/check .githooks/pre-commit.d .githooks/pre-push.d
-run_step 'markdown' "$local_timeout" markdownlint-cli2 README.md PLUGIN_OVERVIEW.md AGENTS.md
+run_step 'markdown' "$local_timeout" markdownlint-cli2 README.md PLUGIN_OVERVIEW.md AGENTS.md skills/agy-provider/SKILL.md
 # The smoke parses fixtures offline and reads live quota when `agy` is signed in.
 run_step 'usage smoke' "$local_timeout" npm run smoke
 printf 'All project checks passed.\n'

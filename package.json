@@ -48,7 +48,9 @@
     "server": "./server.ts",
     "app": "./app.tsx",
     "host": "./host.ts",
-    "skills": []
+    "skills": [
+      "skills"
+    ]
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

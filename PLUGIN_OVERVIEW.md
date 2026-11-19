@@ -7,6 +7,10 @@ typeahead, and quota visibility as built-in providers.
 - **First-class agent provider (`agy`):** Select Antigravity models and
   reasoning effort levels (`low`, `medium`, `high`, `xhigh`, `max`), or run
   `/compact` and `bb thread compact` on long sessions.
+- **Configurable auto-compaction with continuation:** Automatically compacts
+  `agy` threads once context usage reaches a configurable token cap (default
+  `250000` tokens) and immediately resumes active sessions without pausing,
+  configurable in plugin settings or `bb plugin config agy`.
 - **Official multicolor branding everywhere:** Renders the multicolor
   Antigravity mark across sidebar thread rows, new-thread and follow-up
   composer pickers, thread headers, **Settings -> Providers**, **Settings ->

@@ -11,7 +11,7 @@ bb loads three bundles from `package.json` → `bb`:
 
 | Entry | Runs in | Owns |
 | --- | --- | --- |
-| `server.ts` | bb server | Provider registration, usage RPC source |
+| `server.ts` | bb server | Provider registration, usage RPC source, auto-compaction |
 | `host.ts` | host daemon, on the thread's machine | ACP bridge, `agy` dialect, `agy` processes |
 | `app.tsx` | bb web UI | Multicolor icon on provider slots |
 

@@ -34,8 +34,11 @@ bb plugin build . && bb plugin reload agy
 ## Architecture
 
 - **`server.ts`**: Registers the `agy` provider (models, reasoning levels, ACP
-  modes, `/compact`, native skill roots, sign-in hint) and the
-  `provider-usage.v1` RPC source.
+  modes, `/compact`, native skill roots, sign-in hint), the `provider-usage.v1`
+  RPC source, and automatic compaction.
+- **`src/auto-compact.ts`, `src/auto-compact-policy.ts`**: Defines the
+  auto-compaction settings, inspects tool boundaries, compacts `agy` threads at
+  the configured token threshold, and automatically resumes active sessions.
 - **`app.tsx`**: Mounts the multicolor SVG on
   `app.slots.experimental_providerIcon` and `app.experimental_icons`, with
   per-instance `useId()` paint-server IDs.
@@ -48,6 +51,32 @@ bb plugin build . && bb plugin reload agy
   deduplication and a `refresh` cache bypass.
 - **`src/constants.ts`, `src/icon-spec.ts`**: Shared constants and brand
   geometry.
+
+## Auto-compaction
+
+`agy` has no native setting to lower its backend compaction ceiling. This plugin
+monitors reported token usage on `agy` threads and triggers compaction once
+`usedTokens` reaches the configured threshold (default `250000` tokens):
+
+- **Active turns:** At the next tool-free step boundary, the plugin yields the
+  turn cleanly on the same live ACP process, runs compaction, and immediately
+  resumes the session with an agent-only continuation turn so work never stops
+  or pauses.
+- **Idle turns:** If a turn completes above the threshold on its own, compaction
+  runs in place on the idle thread without restarting `agy`.
+
+Configure under **Settings -> Installed plugins -> Antigravity** or via CLI:
+
+```sh
+bb plugin config agy
+bb plugin config agy set autoCompactEnabled true
+bb plugin config agy set autoCompactTokenThreshold 250000
+```
+
+| Setting | Default | Range |
+| --- | --- | --- |
+| `autoCompactEnabled` | `true` | `true` or `false` |
+| `autoCompactTokenThreshold` | `250000` | integer `1000`–`2000000` |
 
 ## Usage mapping
 
