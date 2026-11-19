@@ -5,12 +5,28 @@
  */
 
 import { z } from "zod";
-import { AUTO_COMPACT_MESSAGE_PREFIX, PROVIDER_ID } from "./constants.ts";
+import {
+  AUTO_COMPACT_AGENT_ONLY_VISIBILITY,
+  AUTO_COMPACT_MESSAGE_PREFIX,
+  AUTO_COMPACT_TEXT_BLOCK_TYPE,
+  PROVIDER_ID,
+} from "./constants.ts";
 
 const ZERO_COUNT = 0 as const;
+const FIRST_EVENT_INDEX = 0 as const;
 const SINGLE_BLOCK_COUNT = 1 as const;
-const TEXT_BLOCK_TYPE = "text" as const;
+const EMPTY_TURN_STATUS = "" as const;
 const COMMAND_RESOURCE_KIND = "command" as const;
+const USER_INITIATOR = "user" as const;
+const COMPACT_COMMAND_NAME = "compact" as const;
+const COMPACT_COMMAND_TEXT = "/compact" as const;
+const COMPACTION_SKIPPED_WARNING = "compaction-skipped" as const;
+
+/** Non-tool SDK `ThreadItem` variants safe to steer around without aborting tools. */
+const REASONING_ITEM_TYPE = "reasoning" as const;
+const AGENT_MESSAGE_ITEM_TYPE = "agentMessage" as const;
+const USER_MESSAGE_ITEM_TYPE = "userMessage" as const;
+const COMPACTION_ITEM_TYPE = "contextCompaction" as const;
 
 const TURN_STARTED_EVENT = "turn/started" as const;
 const TURN_COMPLETED_EVENT = "turn/completed" as const;
@@ -24,22 +40,17 @@ const CLIENT_TURN_REQUESTED_EVENT = "client/turn/requested" as const;
 const THREAD_INTERRUPTED_EVENT = "system/thread/interrupted" as const;
 const PROVIDER_WARNING_EVENT = "provider/warning" as const;
 
-const REASONING_ITEM_TYPE = "reasoning" as const;
-const AGENT_MESSAGE_ITEM_TYPE = "agentMessage" as const;
-const USER_MESSAGE_ITEM_TYPE = "userMessage" as const;
-const COMPACTION_ITEM_TYPE = "compaction" as const;
-const COMPACTION_SKIPPED_WARNING = "compaction-skipped" as const;
-const COMPACT_COMMAND_NAME = "compact" as const;
-const COMPACT_COMMAND_TEXT = "/compact" as const;
-const AGENT_ONLY_VISIBILITY = "agent-only" as const;
+const REQUEST_KIND_COMPACT = "compact" as const;
+const REQUEST_KIND_USER = "user" as const;
 
-const COMPACT_REQUEST_KIND = "compact" as const;
-const USER_REQUEST_KIND = "user" as const;
-const IGNORED_REQUEST_KIND = "ignore" as const;
+type ClientRequestKind =
+  | typeof REQUEST_KIND_COMPACT
+  | typeof REQUEST_KIND_USER
+  | null;
 
 /**
- * Item types that represent model output or user text rather than an executing
- * tool; steering during these items avoids aborting live commands or edits.
+ * Item types that represent model output, user text, or compaction rather than
+ * an executing tool; steering during these avoids aborting live commands or edits.
  */
 const NON_TOOL_ITEM_TYPES: ReadonlySet<string> = new Set([
   REASONING_ITEM_TYPE,
@@ -63,14 +74,19 @@ export const AUTO_COMPACT_BOUNDARY_EVENT_TYPES = [
 ] as const;
 
 /**
- * Recent item and usage events queried to detect open tool calls and confirm
- * context usage is strictly newer than the last compaction boundary.
+ * Tool item lifecycle events queried strictly disjoint from boundary and usage
+ * queries so the item window budget tracks open tools without noise.
  */
 export const AUTO_COMPACT_ITEM_EVENT_TYPES = [
-  TURN_STARTED_EVENT,
-  TURN_COMPLETED_EVENT,
   ITEM_STARTED_EVENT,
   ITEM_COMPLETED_EVENT,
+] as const;
+
+/**
+ * Context usage events queried in a dedicated single-row lookup so high tool
+ * volume can never evict the latest usage watermark.
+ */
+export const AUTO_COMPACT_USAGE_EVENT_TYPES = [
   CONTEXT_USAGE_UPDATED_EVENT,
 ] as const;
 
@@ -106,6 +122,9 @@ const clientRequestBlockSchema = z.object({
 });
 
 const clientTurnRequestedDataSchema = z.object({
+  // Accept any string so future SDK initiators never break `/compact` parsing
+  // while still failing closed on any non-`"user"` initiator.
+  initiator: z.string().optional(),
   input: z.array(clientRequestBlockSchema).optional(),
   originPluginId: z.string().nullable().optional(),
 });
@@ -133,36 +152,23 @@ export interface RecentThreadActivity {
   readonly hasOpenToolExecution: boolean;
 }
 
-interface ActivityAccumulator {
-  latestTurnStartedSeq: number | null;
-  latestTurnCompleted: { seq: number; status: string } | null;
-  latestCompactionBoundarySeq: number;
-  latestUsageEventSeq: number;
-  latestUserRequestSeq: number;
-  latestInterruptedSeq: number;
-  latestCompactRequestSeq: number;
-  insideCurrentTurn: boolean;
-  isCompactionTurn: boolean;
-  hasOpenToolExecution: boolean;
-  readonly completedItemIds: Set<string>;
-}
-
-/** Deduplicates overlapping boundary and item queries while preserving newest-first order. */
+/**
+ * Combines disjoint boundary, item, and usage event windows into one
+ * newest-first stream so downstream boundary analysis runs in a single pass.
+ */
 export function mergeRecentThreadEvents(
-  boundaryEvents: readonly RecentThreadEvent[],
-  itemEvents: readonly RecentThreadEvent[],
+  ...eventWindows: ReadonlyArray<readonly RecentThreadEvent[]>
 ): RecentThreadEvent[] {
   const bySeq = new Map<number, RecentThreadEvent>();
-  for (const event of boundaryEvents) {
-    bySeq.set(event.seq, event);
-  }
-  for (const event of itemEvents) {
-    bySeq.set(event.seq, event);
+  for (const window of eventWindows) {
+    for (const event of window) {
+      bySeq.set(event.seq, event);
+    }
   }
   return Array.from(bySeq.values()).sort((left, right) => right.seq - left.seq);
 }
 
-/** Detects standalone `/compact` client requests so they never reset user-turn counters. */
+/** Identifies standalone `/compact` commands so they never reset user-turn counters. */
 function isCompactClientRequest(
   blocks: readonly z.infer<typeof clientRequestBlockSchema>[],
 ): boolean {
@@ -170,10 +176,10 @@ function isCompactClientRequest(
     return false;
   }
   const [first] = blocks;
-  if (first === undefined || first.type !== TEXT_BLOCK_TYPE) {
+  if (first === undefined || first.type !== AUTO_COMPACT_TEXT_BLOCK_TYPE) {
     return false;
   }
-  if ((first.text ?? "").trim() === COMPACT_COMMAND_TEXT) {
+  if (first.text?.trim() === COMPACT_COMMAND_TEXT) {
     return true;
   }
   return (first.mentions ?? []).some(
@@ -193,56 +199,70 @@ function isPluginAutoCompactRequest(
   }
   return blocks.some(
     (block) =>
-      block.type === TEXT_BLOCK_TYPE &&
-      block.visibility === AGENT_ONLY_VISIBILITY &&
-      (block.text ?? "").startsWith(AUTO_COMPACT_MESSAGE_PREFIX),
+      block.type === AUTO_COMPACT_TEXT_BLOCK_TYPE &&
+      block.visibility === AUTO_COMPACT_AGENT_ONLY_VISIBILITY &&
+      block.text?.startsWith(AUTO_COMPACT_MESSAGE_PREFIX) === true,
   );
 }
 
-/** Separates human prompts from `/compact` and plugin/malformed events to guard loop counters. */
-function classifyClientRequest(
-  data: unknown,
-):
-  | typeof COMPACT_REQUEST_KIND
-  | typeof USER_REQUEST_KIND
-  | typeof IGNORED_REQUEST_KIND {
+/**
+ * Isolates real user prompts and `/compact` requests from plugin continuations
+ * and non-user messages so only human prompts reset loop-breaker counters.
+ */
+function classifyClientRequest(data: unknown): ClientRequestKind {
   const parsed = clientTurnRequestedDataSchema.safeParse(data);
   if (!parsed.success) {
-    return IGNORED_REQUEST_KIND;
+    return null;
   }
   const blocks = parsed.data.input ?? [];
   if (isCompactClientRequest(blocks)) {
-    return COMPACT_REQUEST_KIND;
+    return REQUEST_KIND_COMPACT;
   }
   if (isPluginAutoCompactRequest(parsed.data.originPluginId, blocks)) {
-    return IGNORED_REQUEST_KIND;
+    return null;
   }
-  return USER_REQUEST_KIND;
+  if (
+    parsed.data.initiator !== undefined &&
+    parsed.data.initiator !== USER_INITIATOR
+  ) {
+    return null;
+  }
+  return REQUEST_KIND_USER;
 }
 
-/** Prevents steering while a tool item started in the active turn is still unfinished. */
+/**
+ * Prevents steering while a tool item started in the active turn is unfinished;
+ * fails closed when an `item/started` payload cannot be parsed.
+ */
 function inspectTurnItemEvent(
   event: RecentThreadEvent,
-  acc: ActivityAccumulator,
+  completedItemIds: Set<string>,
+  state: { isCompactionTurn: boolean; hasOpenToolExecution: boolean },
 ): void {
   const parsed = itemEventDataSchema.safeParse(event.data);
   if (!parsed.success) {
+    if (event.type === ITEM_STARTED_EVENT) {
+      state.hasOpenToolExecution = true;
+    }
     return;
   }
   const { id, type } = parsed.data.item;
   if (type === COMPACTION_ITEM_TYPE) {
-    acc.isCompactionTurn = true;
+    state.isCompactionTurn = true;
   }
   if (event.type === ITEM_COMPLETED_EVENT) {
-    acc.completedItemIds.add(id);
+    completedItemIds.add(id);
     return;
   }
-  if (!acc.completedItemIds.has(id) && !NON_TOOL_ITEM_TYPES.has(type)) {
-    acc.hasOpenToolExecution = true;
+  if (!completedItemIds.has(id) && !NON_TOOL_ITEM_TYPES.has(type)) {
+    state.hasOpenToolExecution = true;
   }
 }
 
-/** Treats skipped-compaction warnings as boundaries so unshrinkable contexts do not loop. */
+/**
+ * Recognizes compaction, context-clear, and skipped-compaction events as
+ * boundaries so unshrinkable or freshly cleared contexts cannot loop.
+ */
 function isCompactionBoundaryEvent(event: RecentThreadEvent): boolean {
   if (
     event.type === THREAD_COMPACTED_EVENT ||
@@ -257,6 +277,22 @@ function isCompactionBoundaryEvent(event: RecentThreadEvent): boolean {
   return parsed.success && parsed.data.category === COMPACTION_SKIPPED_WARNING;
 }
 
+interface ActivityAccumulator {
+  latestTurnStartedSeq: number | null;
+  latestTurnCompleted: { seq: number; status: string } | null;
+  latestCompactionBoundarySeq: number;
+  latestUsageEventSeq: number;
+  latestUserRequestSeq: number;
+  latestInterruptedSeq: number;
+  latestCompactRequestSeq: number;
+  insideCurrentTurn: boolean;
+  readonly completedItemIds: Set<string>;
+  readonly turnItems: {
+    isCompactionTurn: boolean;
+    hasOpenToolExecution: boolean;
+  };
+}
+
 /** Closes the active-turn item window once a prior `turn/completed` boundary is reached. */
 function recordTurnCompleted(
   event: RecentThreadEvent,
@@ -266,21 +302,21 @@ function recordTurnCompleted(
     const parsed = turnCompletedDataSchema.safeParse(event.data);
     acc.latestTurnCompleted = {
       seq: event.seq,
-      status: parsed.success ? parsed.data.status : "",
+      status: parsed.success ? parsed.data.status : EMPTY_TURN_STATUS,
     };
   }
   acc.insideCurrentTurn = false;
 }
 
-/** Tracks user-turn resets separately from pending manual `/compact` requests. */
+/** Separates user prompts from manual `/compact` requests for boundary tracking. */
 function recordClientRequest(
   event: RecentThreadEvent,
   acc: ActivityAccumulator,
 ): void {
   const kind = classifyClientRequest(event.data);
-  if (kind === USER_REQUEST_KIND) {
+  if (kind === REQUEST_KIND_USER) {
     acc.latestUserRequestSeq = Math.max(acc.latestUserRequestSeq, event.seq);
-  } else if (kind === COMPACT_REQUEST_KIND) {
+  } else if (kind === REQUEST_KIND_COMPACT) {
     acc.latestCompactRequestSeq = Math.max(
       acc.latestCompactRequestSeq,
       event.seq,
@@ -288,10 +324,7 @@ function recordClientRequest(
   }
 }
 
-/**
- * Stops inspecting tool items once `turn/started` or `turn/completed` is crossed
- * in descending order so items from earlier turns never block the active turn.
- */
+/** Updates turn, tool, usage, and compaction watermarks from one descending event row. */
 function recordRecentEvent(
   event: RecentThreadEvent,
   acc: ActivityAccumulator,
@@ -313,7 +346,7 @@ function recordRecentEvent(
     case ITEM_STARTED_EVENT:
     case ITEM_COMPLETED_EVENT:
       if (acc.insideCurrentTurn) {
-        inspectTurnItemEvent(event, acc);
+        inspectTurnItemEvent(event, acc.completedItemIds, acc.turnItems);
       }
       return;
     case CONTEXT_USAGE_UPDATED_EVENT:
@@ -331,9 +364,8 @@ function recordRecentEvent(
 }
 
 /**
- * Summarizes a descending (`order: "desc"`) window of non-delta events into
- * the boundary facts needed for safe mid-turn and post-turn decisions without
- * scanning full thread histories.
+ * Reduces a descending (`order: "desc"`) non-delta event window into the
+ * boundary facts required for safe mid-turn and post-turn compaction decisions.
  */
 export function analyzeRecentThreadEvents(
   events: readonly RecentThreadEvent[],
@@ -347,25 +379,30 @@ export function analyzeRecentThreadEvents(
     latestInterruptedSeq: ZERO_COUNT,
     latestCompactRequestSeq: ZERO_COUNT,
     insideCurrentTurn: true,
-    isCompactionTurn: false,
-    hasOpenToolExecution: false,
     completedItemIds: new Set<string>(),
+    turnItems: { isCompactionTurn: false, hasOpenToolExecution: false },
   };
   for (const event of events) {
     recordRecentEvent(event, acc);
   }
+  const latestCompactSettlementSeq = Math.max(
+    acc.latestTurnCompleted?.seq ?? ZERO_COUNT,
+    acc.latestCompactionBoundarySeq,
+    acc.latestInterruptedSeq,
+    acc.latestUserRequestSeq,
+  );
   const pendingCompactRequest =
-    acc.latestCompactRequestSeq > (acc.latestTurnCompleted?.seq ?? ZERO_COUNT);
+    acc.latestCompactRequestSeq > latestCompactSettlementSeq;
 
   return {
-    latestSeq: events[0]?.seq ?? ZERO_COUNT,
+    latestSeq: events[FIRST_EVENT_INDEX]?.seq ?? ZERO_COUNT,
     latestTurnStartedSeq: acc.latestTurnStartedSeq,
     latestTurnCompleted: acc.latestTurnCompleted,
     latestCompactionBoundarySeq: acc.latestCompactionBoundarySeq,
     latestUsageEventSeq: acc.latestUsageEventSeq,
     latestUserRequestSeq: acc.latestUserRequestSeq,
     latestInterruptedSeq: acc.latestInterruptedSeq,
-    isCompactionTurn: acc.isCompactionTurn || pendingCompactRequest,
-    hasOpenToolExecution: acc.hasOpenToolExecution,
+    isCompactionTurn: acc.turnItems.isCompactionTurn || pendingCompactRequest,
+    hasOpenToolExecution: acc.turnItems.hasOpenToolExecution,
   };
 }

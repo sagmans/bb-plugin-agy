@@ -9,16 +9,53 @@ import type { RecentThreadActivity } from "./auto-compact-events.ts";
 import {
   AUTO_COMPACT_MAX_CONSECUTIVE,
   AUTO_COMPACT_MESSAGE_PREFIX,
+  AUTO_COMPACT_TOKEN_LOCALE,
   AUTO_COMPACT_TOKEN_THRESHOLD_MAX,
   AUTO_COMPACT_TOKEN_THRESHOLD_MIN,
   PROVIDER_ID,
 } from "./constants.ts";
 
-const ACTIVE_STATUS = "active" as const;
-const IDLE_STATUS = "idle" as const;
 const ZERO_COUNT = 0 as const;
-const TOKEN_LOCALE = "en-US" as const;
 const COMPLETED_TURN_STATUS = "completed" as const;
+const DECISION_SKIP = "skip" as const;
+
+export const ACTIVE_THREAD_STATUS = "active" as const;
+export const IDLE_THREAD_STATUS = "idle" as const;
+export const AUTO_COMPACT_MODE_MID_TURN = "mid-turn" as const;
+export const AUTO_COMPACT_MODE_IDLE = "idle" as const;
+export const DECISION_COMPACT = "compact" as const;
+
+const SKIP_DISABLED = "disabled" as const;
+const SKIP_INVALID_THRESHOLD = "invalid-threshold" as const;
+const SKIP_MISSING_USAGE = "missing-usage" as const;
+const SKIP_BELOW_THRESHOLD = "below-threshold" as const;
+const SKIP_STALE_USAGE = "stale-pre-compaction-usage" as const;
+const SKIP_COMPACTION_TURN = "compaction-turn" as const;
+const SKIP_OPEN_TOOL = "open-tool-execution" as const;
+const SKIP_NO_TURN = "no-turn-started" as const;
+const SKIP_ALREADY_COMPACTED = "already-compacted-or-cleared" as const;
+const SKIP_ALREADY_ATTEMPTED = "already-attempted" as const;
+const SKIP_AWAITING_DROP = "awaiting-drop-or-new-turn" as const;
+const SKIP_MAX_CONSECUTIVE = "max-consecutive-auto-compactions" as const;
+
+/** Typed skip reasons so diagnostic logs and policy callers never rely on arbitrary strings. */
+export type AutoCompactSkipReason =
+  | typeof SKIP_DISABLED
+  | typeof SKIP_INVALID_THRESHOLD
+  | typeof SKIP_MISSING_USAGE
+  | typeof SKIP_BELOW_THRESHOLD
+  | typeof SKIP_STALE_USAGE
+  | typeof SKIP_COMPACTION_TURN
+  | typeof SKIP_OPEN_TOOL
+  | typeof SKIP_NO_TURN
+  | typeof SKIP_ALREADY_COMPACTED
+  | typeof SKIP_ALREADY_ATTEMPTED
+  | typeof SKIP_AWAITING_DROP
+  | typeof SKIP_MAX_CONSECUTIVE;
+
+export type AutoCompactExpectedStatus =
+  | typeof ACTIVE_THREAD_STATUS
+  | typeof IDLE_THREAD_STATUS;
 
 const THRESHOLD_INT_MESSAGE =
   "Auto-compact token threshold must be a whole number." as const;
@@ -57,47 +94,43 @@ export interface ContextUsageSnapshot {
   readonly modelContextWindow: number;
 }
 
-/** Captures idle-thread facts needed for safe post-turn background compaction. */
-export interface IdleDecisionInput {
+interface AutoCompactDecisionBaseInput {
   readonly enabled: boolean;
   readonly threshold: number;
   readonly usedTokens: number | null;
   readonly activity: RecentThreadActivity;
   readonly awaitingDropOrNewTurn: boolean;
-  readonly lastAttemptedTurnSeq: number | undefined;
+  readonly lastAttemptedTurnSeq: number | null;
 }
 
-/** Extends idle inputs with active-turn loop count to guard mid-turn yields. */
-export interface MidTurnDecisionInput extends IdleDecisionInput {
-  readonly consecutiveAutoCompactions: number;
-}
+/**
+ * Discriminates mid-turn and idle policy inputs so idle callers never pass
+ * dummy circuit-breaker counts.
+ */
+export type AutoCompactDecisionInput =
+  | (AutoCompactDecisionBaseInput & {
+      readonly mode: typeof AUTO_COMPACT_MODE_MID_TURN;
+      readonly consecutiveAutoCompactions: number;
+    })
+  | (AutoCompactDecisionBaseInput & {
+      readonly mode: typeof AUTO_COMPACT_MODE_IDLE;
+    });
 
-/** Discriminates actionable compactions from diagnostic skip reasons. */
+/** Discriminates actionable compactions from typed diagnostic skip reasons. */
 export type AutoCompactDecision =
   | {
-      readonly action: "compact";
+      readonly action: typeof DECISION_COMPACT;
       readonly turnSeq: number;
-      readonly usedTokens: number;
     }
-  | { readonly action: "skip"; readonly reason: string };
+  | {
+      readonly action: typeof DECISION_SKIP;
+      readonly reason: AutoCompactSkipReason;
+    };
 
-const SKIP_DISABLED = "disabled" as const;
-const SKIP_INVALID_THRESHOLD = "invalid-threshold" as const;
-const SKIP_MISSING_USAGE = "missing-usage" as const;
-const SKIP_BELOW_THRESHOLD = "below-threshold" as const;
-const SKIP_STALE_USAGE = "stale-pre-compaction-usage" as const;
-const SKIP_COMPACTION_TURN = "compaction-turn" as const;
-const SKIP_OPEN_TOOL = "open-tool-execution" as const;
-const SKIP_NO_TURN = "no-turn-started" as const;
-const SKIP_ALREADY_COMPACTED = "already-compacted-or-cleared" as const;
-const SKIP_ALREADY_ATTEMPTED = "already-attempted" as const;
-const SKIP_AWAITING_DROP = "awaiting-drop-or-new-turn" as const;
-const SKIP_MAX_CONSECUTIVE = "max-consecutive-auto-compactions" as const;
-
-/** Shared live-thread guard preventing queue and subagent races. */
-function isLiveUnqueuedAgyThread(
+/** Restricts compaction checks to live, unqueued `agy` threads in the expected lifecycle state. */
+export function isEligibleAutoCompactThread(
   thread: AutoCompactThreadCandidate,
-  expectedStatus: string,
+  expectedStatus: AutoCompactExpectedStatus,
 ): boolean {
   return (
     thread.providerId === PROVIDER_ID &&
@@ -109,55 +142,72 @@ function isLiveUnqueuedAgyThread(
   );
 }
 
-/** Restricts idle compaction to live, idle `agy` threads without queued work. */
-export function isEligibleIdleAutoCompactThread(
-  thread: AutoCompactThreadCandidate,
-): boolean {
-  return isLiveUnqueuedAgyThread(thread, IDLE_STATUS);
+/** Enforces compaction-turn exclusion and active-turn safety caps before threshold checks. */
+function evaluateModeSkipReason(
+  input: AutoCompactDecisionInput,
+): AutoCompactSkipReason | null {
+  if (input.activity.isCompactionTurn) {
+    return SKIP_COMPACTION_TURN;
+  }
+  if (input.mode === AUTO_COMPACT_MODE_MID_TURN) {
+    if (input.activity.hasOpenToolExecution) {
+      return SKIP_OPEN_TOOL;
+    }
+    if (input.consecutiveAutoCompactions >= AUTO_COMPACT_MAX_CONSECUTIVE) {
+      return SKIP_MAX_CONSECUTIVE;
+    }
+  }
+  return null;
 }
 
-/** Restricts mid-turn checks to live, active `agy` threads without queued work. */
-export function isEligibleActiveAutoCompactThread(
-  thread: AutoCompactThreadCandidate,
-): boolean {
-  return isLiveUnqueuedAgyThread(thread, ACTIVE_STATUS);
-}
-
-/** Rejects disabled configs, malformed thresholds, or below-threshold token counts early. */
-function thresholdSkipReason(
-  enabled: boolean,
-  threshold: number,
-  usedTokens: number | null,
-): string | null {
-  if (!enabled) {
+/** Rejects disabled, malformed, missing, or sub-threshold usage before boundary checks. */
+function evaluateUsageSkipReason(
+  input: AutoCompactDecisionInput,
+): AutoCompactSkipReason | null {
+  if (!input.enabled) {
     return SKIP_DISABLED;
   }
-  if (!autoCompactThresholdSchema.safeParse(threshold).success) {
+  if (!autoCompactThresholdSchema.safeParse(input.threshold).success) {
     return SKIP_INVALID_THRESHOLD;
   }
   if (
-    usedTokens === null ||
-    !Number.isFinite(usedTokens) ||
-    usedTokens < ZERO_COUNT
+    input.usedTokens === null ||
+    !Number.isFinite(input.usedTokens) ||
+    input.usedTokens < ZERO_COUNT
   ) {
     return SKIP_MISSING_USAGE;
   }
-  if (usedTokens < threshold) {
+  if (input.usedTokens < input.threshold) {
     return SKIP_BELOW_THRESHOLD;
   }
   return null;
 }
 
-/** Prevents duplicate triggers when usage is stale or the turn already compacted. */
-function turnGuardSkipReason(
+/** Checks whether the latest `turn/started` belongs to a prior finished or interrupted turn. */
+function isStaleMidTurnBoundary(
   activity: RecentThreadActivity,
-  awaitingDropOrNewTurn: boolean,
-  lastAttemptedTurnSeq: number | undefined,
-): string | null {
-  if (activity.latestTurnStartedSeq === null) {
+  turnSeq: number,
+): boolean {
+  return (
+    (activity.latestTurnCompleted !== null &&
+      turnSeq <= activity.latestTurnCompleted.seq) ||
+    turnSeq <= activity.latestInterruptedSeq
+  );
+}
+
+/** Prevents steering stale turns, compacting stale usage, or looping on unshrinkable context. */
+function evaluateBoundarySkipReason(
+  input: AutoCompactDecisionInput,
+  turnSeq: number,
+): AutoCompactSkipReason | null {
+  const { activity } = input;
+  if (
+    input.mode === AUTO_COMPACT_MODE_MID_TURN &&
+    isStaleMidTurnBoundary(activity, turnSeq)
+  ) {
     return SKIP_NO_TURN;
   }
-  if (activity.latestTurnStartedSeq <= activity.latestCompactionBoundarySeq) {
+  if (turnSeq <= activity.latestCompactionBoundarySeq) {
     return SKIP_ALREADY_COMPACTED;
   }
   if (
@@ -166,97 +216,88 @@ function turnGuardSkipReason(
   ) {
     return SKIP_STALE_USAGE;
   }
-  if (awaitingDropOrNewTurn) {
+  if (input.awaitingDropOrNewTurn) {
     return SKIP_AWAITING_DROP;
   }
-  if (lastAttemptedTurnSeq === activity.latestTurnStartedSeq) {
+  if (input.lastAttemptedTurnSeq === turnSeq) {
     return SKIP_ALREADY_ATTEMPTED;
   }
   return null;
 }
 
 /**
- * Decides whether an idle thread should trigger post-turn compaction without
- * looping when compaction skips or leaves usage above the configured threshold.
+ * Decides whether an active turn should yield for compaction or an idle thread
+ * should compact in place while enforcing tool-safety and loop invariants.
  */
-export function evaluateIdleAutoCompactDecision(
-  input: IdleDecisionInput,
+export function evaluateAutoCompactDecision(
+  input: AutoCompactDecisionInput,
 ): AutoCompactDecision {
-  const usageSkip = thresholdSkipReason(
-    input.enabled,
-    input.threshold,
-    input.usedTokens,
-  );
-  if (usageSkip !== null) {
-    return { action: "skip", reason: usageSkip };
+  const preBoundarySkip =
+    evaluateModeSkipReason(input) ?? evaluateUsageSkipReason(input);
+  if (preBoundarySkip !== null) {
+    return { action: DECISION_SKIP, reason: preBoundarySkip };
   }
-  const guardSkip = turnGuardSkipReason(
-    input.activity,
-    input.awaitingDropOrNewTurn,
-    input.lastAttemptedTurnSeq,
-  );
-  if (guardSkip !== null) {
-    return { action: "skip", reason: guardSkip };
+  const turnSeq = input.activity.latestTurnStartedSeq;
+  if (turnSeq === null) {
+    return { action: DECISION_SKIP, reason: SKIP_NO_TURN };
   }
-  return {
-    action: "compact",
-    turnSeq: input.activity.latestTurnStartedSeq as number,
-    usedTokens: input.usedTokens as number,
-  };
+  const boundarySkip = evaluateBoundarySkipReason(input, turnSeq);
+  if (boundarySkip !== null) {
+    return { action: DECISION_SKIP, reason: boundarySkip };
+  }
+  return { action: DECISION_COMPACT, turnSeq };
 }
 
 /**
- * Decides whether an active turn should yield for compaction and immediately
- * resume, ensuring no running tool is aborted and no loop can form.
+ * Confirms the steered turn itself finished cleanly after the yield steer,
+ * rejecting user stops, newer prompts, newer started turns, and mid-yield
+ * compactions so post-yield `compactFirst` never double-compacts or hijacks.
  */
-export function evaluateMidTurnAutoCompactDecision(
-  input: MidTurnDecisionInput,
-): AutoCompactDecision {
-  if (input.activity.isCompactionTurn) {
-    return { action: "skip", reason: SKIP_COMPACTION_TURN };
-  }
-  if (input.activity.hasOpenToolExecution) {
-    return { action: "skip", reason: SKIP_OPEN_TOOL };
-  }
-  if (input.consecutiveAutoCompactions >= AUTO_COMPACT_MAX_CONSECUTIVE) {
-    return { action: "skip", reason: SKIP_MAX_CONSECUTIVE };
-  }
-  return evaluateIdleAutoCompactDecision(input);
-}
-
-/** Confirms a steered mid-turn yield ended normally rather than by user Stop. */
 export function canResumeAfterMidTurnYield(
   activity: RecentThreadActivity,
   yieldSteerSeq: number,
 ): boolean {
-  if (activity.latestInterruptedSeq > yieldSteerSeq) {
+  if (
+    activity.isCompactionTurn ||
+    activity.latestCompactionBoundarySeq > yieldSteerSeq ||
+    activity.latestInterruptedSeq > yieldSteerSeq ||
+    activity.latestUserRequestSeq > yieldSteerSeq
+  ) {
     return false;
   }
+  if (
+    activity.latestTurnStartedSeq !== null &&
+    activity.latestTurnStartedSeq > yieldSteerSeq
+  ) {
+    return false;
+  }
+  const completed = activity.latestTurnCompleted;
   return (
-    activity.latestTurnCompleted !== null &&
-    activity.latestTurnCompleted.status === COMPLETED_TURN_STATUS
+    completed !== null &&
+    completed.status === COMPLETED_TURN_STATUS &&
+    completed.seq > yieldSteerSeq
   );
 }
 
 /**
- * Builds the agent-only steer prompt that asks an active `agy` turn to yield
- * at the current step boundary so compaction can run and immediately resume.
+ * Instructs an active `agy` turn via an agent-only steer to end cleanly at the
+ * current step boundary so compaction can run and immediately resume work.
  */
 export function buildMidTurnYieldPrompt(
   usedTokens: number,
   threshold: number,
 ): string {
   return (
-    `${AUTO_COMPACT_MESSAGE_PREFIX}Context usage reached ${usedTokens.toLocaleString(TOKEN_LOCALE)} tokens ` +
-    `(configured auto-compact cap: ${threshold.toLocaleString(TOKEN_LOCALE)}). ` +
+    `${AUTO_COMPACT_MESSAGE_PREFIX}Context usage reached ${usedTokens.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)} tokens ` +
+    `(configured auto-compact cap: ${threshold.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)}). ` +
     "Pause right now so context can compact and automatically resume your session: " +
     "do not invoke any tools, briefly note your current step in one sentence, and end this turn immediately."
   );
 }
 
 /**
- * Builds the agent-only continuation prompt queued behind `compactFirst: true`
- * so the session resumes immediately after compaction without stopping.
+ * Instructs the agent-only continuation turn queued behind `compactFirst: true`
+ * to resume work automatically after compaction without asking the user.
  */
 export function buildPostCompactionResumePrompt(
   usedTokens: number,
@@ -264,7 +305,7 @@ export function buildPostCompactionResumePrompt(
 ): string {
   return (
     `${AUTO_COMPACT_MESSAGE_PREFIX}Context was automatically compacted after reaching ` +
-    `${usedTokens.toLocaleString(TOKEN_LOCALE)} tokens (configured cap: ${threshold.toLocaleString(TOKEN_LOCALE)}). ` +
+    `${usedTokens.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)} tokens (configured cap: ${threshold.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)}). ` +
     "Continue running your in-progress task immediately from where you left off without pausing or asking to continue. " +
     "Only stop if the original request was already completely finished before compaction."
   );

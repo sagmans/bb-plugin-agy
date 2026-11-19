@@ -209,11 +209,17 @@ export const AUTO_COMPACT_TOKEN_THRESHOLD_MIN = 1_000 as const;
 /** Upper bound accommodates current 1M and near-term 2M context windows. */
 export const AUTO_COMPACT_TOKEN_THRESHOLD_MAX = 2_000_000 as const;
 
-/** Prevents stalled loopback reads (`context`, `events.list`) from wedging per-thread locks. */
+/** Prevents stalled loopback reads (`context`, `events.list`, `threads.get`) from wedging per-thread locks. */
 export const AUTO_COMPACT_READ_TIMEOUT_MS = 15_000 as const;
 
-/** Bounds compaction and continuation RPCs so a stuck daemon cannot stall cleanup. */
+/** Bounds fast agent-only yield steer RPCs so a stuck daemon cannot hold per-thread locks. */
 export const AUTO_COMPACT_REQUEST_TIMEOUT_MS = 30_000 as const;
+
+/**
+ * Allows full LLM summarization during `compact` and `compactFirst` RPCs to
+ * settle without falsely timing out large context windows.
+ */
+export const AUTO_COMPACT_COMPACT_TIMEOUT_MS = 120_000 as const;
 
 /** Caps the in-memory thread tracker so long-lived bb servers stay bounded. */
 export const AUTO_COMPACT_MAX_TRACKED_THREADS = 1_000 as const;
@@ -225,10 +231,16 @@ export const AUTO_COMPACT_MAX_TRACKED_THREADS = 1_000 as const;
 export const AUTO_COMPACT_BOUNDARY_EVENTS_LIMIT = "20" as const;
 
 /**
- * Bounds recent item and usage events scanned to detect open tool executions
+ * Bounds recent tool item events scanned to detect open tool executions
  * without loading full conversation histories over loopback.
  */
-export const AUTO_COMPACT_ITEM_EVENTS_LIMIT = "40" as const;
+export const AUTO_COMPACT_ITEM_EVENTS_LIMIT = "100" as const;
+
+/**
+ * Fetches only the newest context usage watermark independently of item volume
+ * so high tool counts never age out stale-usage detection.
+ */
+export const AUTO_COMPACT_USAGE_EVENTS_LIMIT = "1" as const;
 
 /**
  * Circuit breaker capping consecutive automatic mid-turn compactions within a
@@ -239,14 +251,20 @@ export const AUTO_COMPACT_MAX_CONSECUTIVE = 10 as const;
 /** Recovers thread state if a steered mid-turn yield never settles to idle. */
 export const AUTO_COMPACT_YIELD_TIMEOUT_MS = 60_000 as const;
 
-/** Recovers thread state if a compaction or continuation phase stalls. */
-export const AUTO_COMPACT_PHASE_TIMEOUT_MS = 180_000 as const;
-
 /**
  * Marks plugin-authored agent-only yield and continuation turns so history
  * inspection distinguishes them from user-initiated prompts even after reload.
  */
 export const AUTO_COMPACT_MESSAGE_PREFIX = "[bb-plugin-agy] " as const;
 
-/** Matches BB's HTTP 404 host-lookup error status when a host is removed. */
+/** Shared locale formatting token counts consistently across settings and prompts. */
+export const AUTO_COMPACT_TOKEN_LOCALE = "en-US" as const;
+
+/** Shared BB SDK content block type used when authoring and parsing control prompts. */
+export const AUTO_COMPACT_TEXT_BLOCK_TYPE = "text" as const;
+
+/** Shared BB SDK visibility hiding auto-compact control prompts from user chat history. */
+export const AUTO_COMPACT_AGENT_ONLY_VISIBILITY = "agent-only" as const;
+
+/** Matches BB's HTTP 404 status when a host or thread has been removed. */
 export const HTTP_NOT_FOUND = 404 as const;
