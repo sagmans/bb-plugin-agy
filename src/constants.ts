@@ -169,3 +169,62 @@ export const NATIVE_SKILL_ROOTS = {
     { path: ".agent/skills", ancestors: true },
   ],
 } as const;
+
+/** Setting keys for automatic compaction, shared by registration and docs. */
+export const AUTO_COMPACT_ENABLED_SETTING_KEY = "autoCompactEnabled" as const;
+export const AUTO_COMPACT_TOKEN_THRESHOLD_SETTING_KEY =
+  "autoCompactTokenThreshold" as const;
+
+/** Enables automatic compaction by default to enforce the 250K ceiling. */
+export const AUTO_COMPACT_ENABLED_DEFAULT = true as const;
+
+/**
+ * Default token cap enforced on Antigravity threads so sessions compact well
+ * below `agy`'s backend-controlled 512K compaction ceiling on 1M models.
+ */
+export const AUTO_COMPACT_TOKEN_THRESHOLD_DEFAULT = 250_000 as const;
+
+/** Lower bound prevents accidental tiny thresholds that compact every turn. */
+export const AUTO_COMPACT_TOKEN_THRESHOLD_MIN = 1_000 as const;
+
+/** Upper bound accommodates current 1M and near-term 2M context windows. */
+export const AUTO_COMPACT_TOKEN_THRESHOLD_MAX = 2_000_000 as const;
+
+/** Bounds fast loopback reads (`context`, `events.list`) during threshold checks. */
+export const AUTO_COMPACT_READ_TIMEOUT_MS = 15_000 as const;
+
+/** Bounds compaction and continuation RPCs so a stuck daemon cannot stall cleanup. */
+export const AUTO_COMPACT_REQUEST_TIMEOUT_MS = 30_000 as const;
+
+/** Caps the in-memory thread tracker so long-lived bb servers stay bounded. */
+export const AUTO_COMPACT_MAX_TRACKED_THREADS = 1_000 as const;
+
+/**
+ * Bounds lifecycle boundary events scanned per check so `turn/started`,
+ * `thread/compacted`, and user requests remain visible even on marathon turns.
+ */
+export const AUTO_COMPACT_BOUNDARY_EVENTS_LIMIT = "20" as const;
+
+/**
+ * Bounds recent item and usage events scanned to detect open tool executions
+ * without loading full conversation histories over loopback.
+ */
+export const AUTO_COMPACT_ITEM_EVENTS_LIMIT = "40" as const;
+
+/**
+ * Circuit breaker capping consecutive automatic mid-turn compactions within a
+ * single user prompt so a runaway loop cannot compact indefinitely.
+ */
+export const AUTO_COMPACT_MAX_CONSECUTIVE = 10 as const;
+
+/** Recovers thread state if a steered mid-turn yield never settles to idle. */
+export const AUTO_COMPACT_YIELD_TIMEOUT_MS = 60_000 as const;
+
+/** Recovers thread state if a compaction or continuation phase stalls. */
+export const AUTO_COMPACT_PHASE_TIMEOUT_MS = 180_000 as const;
+
+/**
+ * Marks plugin-authored agent-only yield and continuation turns so history
+ * inspection distinguishes them from user-initiated prompts even after reload.
+ */
+export const AUTO_COMPACT_MESSAGE_PREFIX = "[bb-plugin-agy] " as const;

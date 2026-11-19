@@ -1,11 +1,13 @@
 /**
- * Registers Google Antigravity (`agy`) as a first-class BB agent harness and
- * attaches its `provider-usage.v1` quota source so threads, model/mode/effort
- * pickers, `/compact`, native skills, and usage surfaces behave identically to
- * built-in BB providers.
+ * Registers Google Antigravity (`agy`) as a first-class BB agent harness,
+ * attaches its `provider-usage.v1` quota source, and enforces configurable
+ * auto-compaction (mid-turn with automatic continuation and between turns when
+ * idle) so threads, pickers, `/compact`, native skills, and usage surfaces
+ * behave identically to built-in BB providers.
  */
 
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { registerAutoCompaction } from "./src/auto-compact.ts";
 import {
   ACP_DIALECT_ID,
   ACP_PROVIDER_FAMILY,
@@ -75,4 +77,5 @@ export default function plugin(bb: BbPluginApi) {
   });
 
   registerUsageSource(bb);
+  registerAutoCompaction(bb);
 }
