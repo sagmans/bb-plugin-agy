@@ -4,16 +4,22 @@
  * remain visually identical across light/dark themes and desktop/mobile views.
  */
 
-import { ANTIGRAVITY_BRAND_TINT, ICON_NAME, PROVIDER_ID } from "./constants.ts";
+import {
+  ANTIGRAVITY_BRAND_TINT,
+  DECLARED_PLUGIN_ICON_NAME,
+  PROVIDER_ID,
+} from "./constants.ts";
 
-/** One colour stop of a brand gradient. */
+export { DECLARED_PLUGIN_ICON_NAME };
+
+/** Constrains gradient stop literals so SVG assets and React rendering cannot diverge. */
 export interface RadialStopSpec {
   readonly offset: string;
   readonly stopColor: string;
   readonly stopOpacity: number;
 }
 
-/** Geometry and stops of one brand radial gradient. */
+/** Captures radial paint-server coordinates once for shared rendering and smoke checks. */
 export interface RadialGradientSpec {
   readonly cx: string;
   readonly cy: string;
@@ -32,17 +38,11 @@ export const AGENT_PROVIDER_KIND = "agent" as const;
 export const GENERIC_ACP_ANTIGRAVITY_PROVIDER_ID =
   "acp-antigravity-acp" as const;
 
-/** Every agent-provider id whose icon slot this plugin paints. */
+/** Covers both native plugin threads and legacy generic-ACP threads in one loop. */
 export const REGISTERED_AGENT_PROVIDER_IDS: readonly string[] = [
   PROVIDER_ID,
   GENERIC_ACP_ANTIGRAVITY_PROVIDER_ID,
 ];
-
-/**
- * Overrides the namespaced glyph declared in `server.ts` so host `<Icon>`
- * call sites also render the multicolor mark once the frontend bundle loads.
- */
-export const DECLARED_PLUGIN_ICON_NAME = `${PROVIDER_ID}/${ICON_NAME}`;
 
 /**
  * Matches BB's 16x16 provider icon coordinate grid so optical weight and
@@ -60,7 +60,8 @@ export const ANTIGRAVITY_CANVAS_SIZE = 16 as const;
  * `size-4`, `size-6`) so CSS utility classes always govern the rendered box.
  */
 export const ANTIGRAVITY_INTRINSIC_DIMENSION = 1 as const;
-/** Outline of the Antigravity arch; it clips every colour layer. */
+
+/** Clips full-bleed color and radial-gradient layers to the official Antigravity arch silhouette. */
 export const ANTIGRAVITY_ARCH_PATH =
   "M14.1452 14.6818C14.9937 15.3182 16.2664 14.894 15.0997 13.7273C11.5998 10.3333 12.3421 1 7.99366 1C3.64518 1 4.3876 10.3333 0.887603 13.7273C-0.385123 15 0.993664 15.3182 1.84215 14.6818C5.13002 12.4545 4.9179 8.5303 7.99366 8.5303C11.0694 8.5303 10.8573 12.4545 14.1452 14.6818Z" as const;
 
@@ -69,6 +70,7 @@ export const ANTIGRAVITY_ARCH_PATH =
  * `url(#...)` paint servers can fail when fragment identifiers contain colons.
  */
 export const UNSAFE_SVG_ID_CHARS = /[^a-zA-Z0-9_-]/gu;
+
 /** Namespaces paint-server ids so they cannot collide with host SVG ids. */
 export const SVG_ID_PREFIX = "agy-icon" as const;
 export const CLIP_ID_SUFFIX = "clip" as const;
@@ -81,7 +83,7 @@ export const CROWN_GRADIENT_ID_SUFFIX = "crown" as const;
  */
 export const ANTIGRAVITY_BASE_BLUE = ANTIGRAVITY_BRAND_TINT;
 
-/** Green-to-teal glow on the arch's left shoulder. */
+/** Reproduces the desktop icon's green-to-teal highlight along the left shoulder. */
 export const ANTIGRAVITY_LEFT_SHOULDER_GRADIENT: RadialGradientSpec = {
   cx: "30%",
   cy: "28%",
@@ -93,7 +95,7 @@ export const ANTIGRAVITY_LEFT_SHOULDER_GRADIENT: RadialGradientSpec = {
   ],
 };
 
-/** Orange-to-violet glow across the crown and right side. */
+/** Reproduces the desktop icon's warm crown glow fading into the right arch leg. */
 export const ANTIGRAVITY_CROWN_RIGHT_GRADIENT: RadialGradientSpec = {
   cx: "60%",
   cy: "16%",

@@ -12,7 +12,7 @@
  */
 export const PROVIDER_ID = "agy" as const;
 
-/** Human-readable provider title across pickers, headers, and usage cards. */
+/** Keeps picker, header, and usage card titles uniform across all three bundles. */
 export const PROVIDER_DISPLAY_NAME = "Antigravity" as const;
 
 /** Groups Antigravity with ACP-backed harnesses where BB categorizes families. */
@@ -24,13 +24,13 @@ export const ACP_PROVIDER_FAMILY = "acp" as const;
  */
 export const ACP_DIALECT_ID = PROVIDER_ID;
 
-/** Resolved via portable host toolchain and fallback user bin directories. */
+/** Relies on portable host toolchain lookup plus GUI `PATH` fallbacks at runtime. */
 export const AGY_COMMAND = "agy" as const;
 
-/** Launches Antigravity's ACP stdio JSON-RPC server. */
+/** Selects Antigravity's stdio JSON-RPC mode instead of launching the interactive TUI. */
 export const AGY_ACP_ARGS: readonly string[] = ["acp"];
 
-/** Flag that makes `agy acp` run sign-in and exit instead of serving ACP. */
+/** Forces `agy acp` to complete OAuth sign-in and exit rather than serving sessions. */
 export const AGY_LOGIN_FLAG = "--login" as const;
 
 /**
@@ -55,14 +55,19 @@ export const AGY_USAGE_ARGS: readonly string[] = [
 ];
 
 /**
- * Bounds a signed-out `agy` process (which blocks waiting for browser OAuth)
- * well inside BB's 45-second usage RPC timeout so panels report `unauthenticated`
- * instead of hanging.
+ * Bounds a hung `agy` process well inside BB's 45-second usage RPC deadline so
+ * usage panels degrade cleanly instead of timing out the entire RPC channel.
  */
 export const USAGE_TIMEOUT_MS = 20_000 as const;
 
 /** Guards memory if CLI output ever misbehaves; normal JSON is ~2 KiB. */
 export const USAGE_MAX_BUFFER_BYTES = 1_048_576 as const;
+
+/**
+ * Bounds post-SIGTERM cleanup so a child ignoring polite termination escalates
+ * to `SIGKILL` instead of holding a usage probe open indefinitely.
+ */
+export const USAGE_KILL_SETTLE_TIMEOUT_MS = 1_000 as const;
 
 /**
  * Coalesces simultaneous `provider/health` and `provider/usage` probes on the
@@ -76,13 +81,16 @@ export const BRIDGE_USAGE_CACHE_TTL_MS = 10_000 as const;
  */
 export const SERVER_USAGE_CACHE_TTL_MS = 60_000 as const;
 
-/** Substring `agy` writes to stdout before blocking on interactive OAuth. */
+/**
+ * Detects signed-out OAuth prompts streamed to stdout so the plugin can stop
+ * the child immediately instead of waiting out the full usage timeout.
+ */
 export const AGY_AUTH_REQUIRED_MARKER = "Authentication required" as const;
 
-/** Official documentation linked from BB provider setup surfaces. */
+/** Directs users to vetted manual CLI setup rather than unverified remote scripts. */
 export const AGY_INSTALL_URL = "https://antigravity.google/docs" as const;
 
-/** Official Antigravity installer URL consumed by BB's downloaded-installer helper. */
+/** Satisfies the ACP maintenance dialect contract when SDK callers inspect installer metadata. */
 export const AGY_INSTALLER_URL =
   "https://antigravity.google/cli/install.sh" as const;
 
@@ -92,8 +100,14 @@ export const LOG_PREFIX = `[${PROVIDER_ID}]`;
 /** Antigravity's `/usage` payload omits plan names, so no badge is synthesized. */
 export const USAGE_PLAN_LABEL: string | null = null;
 
-/** Key under `bb.branding.experimental_icons` in `package.json`. */
+/** Matches `bb.branding.experimental_icons` in `package.json` so manifest icons resolve. */
 export const ICON_NAME = PROVIDER_ID;
+
+/**
+ * Single owner of the `<pluginId>/<iconName>` identifier shared by `server.ts`
+ * provider registration and `app.tsx` multicolor icon replacement.
+ */
+export const DECLARED_PLUGIN_ICON_NAME = `${PROVIDER_ID}/${ICON_NAME}` as const;
 
 /**
  * Tints BB's CSS mask fallback in Antigravity blue during the brief window
@@ -135,7 +149,7 @@ export const PERMISSION_MODES = ["accept-edits", "full"] as const;
 
 /**
  * Reasoning effort ladder matching `agy --effort` and built-in BB harnesses,
- * with the picker label for each level.
+ * paired with composer labels so capabilities and UI options stay aligned.
  */
 export const REASONING_LEVEL_OPTIONS = [
   { id: "low", label: "Low" },
@@ -145,14 +159,15 @@ export const REASONING_LEVEL_OPTIONS = [
   { id: "max", label: "Max" },
 ] as const;
 
-/** Effort ids derived from the picker options so the two lists cannot diverge. */
+/** Derives capability ids from `REASONING_LEVEL_OPTIONS` so the two lists cannot diverge. */
 export const REASONING_LEVELS = REASONING_LEVEL_OPTIONS.map(
   (option) => option.id,
 );
 
 /**
- * Mirrors Antigravity's native customization discovery locations so BB lists
- * native `/` and `$` skills in the composer without re-injecting duplicates.
+ * Mirrors all official Antigravity customization discovery directories
+ * (`.gemini`, `.agents`, `.agent`, `_agents`, `_agent`) so BB indexes native
+ * `/` and `$` skills in the composer without re-injecting duplicates.
  */
 export const NATIVE_SKILL_ROOTS = {
   user: [
@@ -163,19 +178,23 @@ export const NATIVE_SKILL_ROOTS = {
     { path: ".gemini/config/plugins", recursive: true },
     ".agents/skills",
     ".agent/skills",
+    "_agents/skills",
+    "_agent/skills",
   ],
   project: [
     { path: ".agents/skills", ancestors: true },
     { path: ".agent/skills", ancestors: true },
+    { path: "_agents/skills", ancestors: true },
+    { path: "_agent/skills", ancestors: true },
   ],
 } as const;
 
-/** Setting keys for automatic compaction, shared by registration and docs. */
+/** Keeps setting keys synchronized across schema registration, docs, and CLI examples. */
 export const AUTO_COMPACT_ENABLED_SETTING_KEY = "autoCompactEnabled" as const;
 export const AUTO_COMPACT_TOKEN_THRESHOLD_SETTING_KEY =
   "autoCompactTokenThreshold" as const;
 
-/** Enables automatic compaction by default to enforce the 250K ceiling. */
+/** Turns on automatic compaction out of the box so 1M-window sessions stay responsive. */
 export const AUTO_COMPACT_ENABLED_DEFAULT = true as const;
 
 /**
@@ -190,7 +209,7 @@ export const AUTO_COMPACT_TOKEN_THRESHOLD_MIN = 1_000 as const;
 /** Upper bound accommodates current 1M and near-term 2M context windows. */
 export const AUTO_COMPACT_TOKEN_THRESHOLD_MAX = 2_000_000 as const;
 
-/** Bounds fast loopback reads (`context`, `events.list`) during threshold checks. */
+/** Prevents stalled loopback reads (`context`, `events.list`) from wedging per-thread locks. */
 export const AUTO_COMPACT_READ_TIMEOUT_MS = 15_000 as const;
 
 /** Bounds compaction and continuation RPCs so a stuck daemon cannot stall cleanup. */

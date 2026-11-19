@@ -16,7 +16,7 @@ import {
   AGY_INSTALL_URL,
   AGY_LOGIN_COMMAND,
   ANTIGRAVITY_BRAND_TINT,
-  ICON_NAME,
+  DECLARED_PLUGIN_ICON_NAME,
   NATIVE_SKILL_ROOTS,
   PERMISSION_MODES,
   PROVIDER_DISPLAY_NAME,
@@ -26,13 +26,30 @@ import {
 } from "./src/constants.ts";
 import { registerUsageSource } from "./src/usage-source.ts";
 
-/** Server entry: bb calls it once per plugin load and disposes it on unload. */
+/** Fails closed if `package.json` name ever diverges from the persisted provider id. */
+class PluginIdMismatchError extends Error {
+  constructor(pluginId: string) {
+    super(
+      `Expected pluginId "${PROVIDER_ID}" to match provider id, received "${pluginId}".`,
+    );
+    this.name = "PluginIdMismatchError";
+  }
+}
+
+/**
+ * Wires provider capabilities, quota RPCs, and auto-compaction into one server
+ * lifecycle scope so `bb plugin reload agy` disposes every listener cleanly.
+ */
 export default function plugin(bb: BbPluginApi) {
+  if (bb.pluginId !== PROVIDER_ID) {
+    throw new PluginIdMismatchError(bb.pluginId);
+  }
+
   const registration = bb.providers.register({
     id: PROVIDER_ID,
     displayName: PROVIDER_DISPLAY_NAME,
     family: ACP_PROVIDER_FAMILY,
-    icon: `${bb.pluginId}/${ICON_NAME}`,
+    icon: DECLARED_PLUGIN_ICON_NAME,
     strings: {
       signInHint: `Run \`${AGY_LOGIN_COMMAND}\` on the machine to sign in.`,
       expiredHint: `Your ${PROVIDER_DISPLAY_NAME} session expired. Run \`${AGY_LOGIN_COMMAND}\` to sign in again, then reload.`,
@@ -52,6 +69,8 @@ export default function plugin(bb: BbPluginApi) {
         env: {},
       },
     },
+    // `installation: false` prevents unpinned remote `curl | sh` execution from
+    // BB's UI; `installUrl` directs users to manual vetted CLI installation.
     maintenance: { health: true, usage: true, installation: false },
     capabilities: {
       supportsServiceTier: false,

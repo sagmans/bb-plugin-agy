@@ -108,6 +108,10 @@ function AntigravityProviderIcon({ className }: { className?: string }) {
   );
 }
 
+/**
+ * Registers multicolor SVG overrides on both provider icon slots and the
+ * declared icon registry so every BB surface renders consistent branding.
+ */
 export default definePluginApp((app) => {
   for (const providerId of REGISTERED_AGENT_PROVIDER_IDS) {
     app.slots.experimental_providerIcon({

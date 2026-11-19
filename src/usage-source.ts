@@ -112,12 +112,12 @@ export const usageSourceContract = defineRpcContract({
 
 type ResourceUsage = z.output<typeof resourceUsageSchema>;
 
-/** One provider's usage as the host bridge returns it, before RPC shaping. */
+/** Isolates the bridge wire payload from the public `provider-usage.v1` RPC schema. */
 type BridgeUsage = NonNullable<
   Awaited<ReturnType<BbPluginApi["sdk"]["system"]["usageLimits"]>>[string]
 >;
 
-/** A provider row from bb's provider inventory. */
+/** Avoids repeating SDK return inference across host-provider filter helpers. */
 type ProviderRow = Awaited<
   ReturnType<BbPluginApi["sdk"]["providers"]["list"]>
 >[number];
@@ -132,8 +132,8 @@ const bridgeWindowSchema = z
 
 const resourceIdSchema = z.tuple([z.string().min(1), z.literal(PROVIDER_ID)]);
 
-/** Resource ids pair host and provider so each machine gets its own usage card. */
-function resourceId(hostId: string): string {
+/** Pairs host and provider ids so multi-host workspaces keep separate quota cards. */
+export function resourceId(hostId: string): string {
   return JSON.stringify([hostId, PROVIDER_ID]);
 }
 
@@ -200,8 +200,8 @@ function accountFields(raw: BridgeUsage) {
 }
 
 /**
- * Turns one host label back into bb's window fields; the index keeps ids
- * unique when two groups share a label.
+ * Reconstructs BB's typed window metadata from the host label while prefixing
+ * `index` so two groups with identical window names keep distinct React keys.
  */
 function toWindow(window: unknown, index: number): UsageWindow {
   const parsed = bridgeWindowSchema.parse(window);
@@ -218,7 +218,7 @@ function toWindow(window: unknown, index: number): UsageWindow {
   };
 }
 
-/** Maps each bridge status to its RPC usage shape; `never` keeps it exhaustive. */
+/** Enforces compile-time exhaustiveness via `never` if the SDK adds new statuses. */
 function toUsage(raw: BridgeUsage): Usage {
   const base = accountFields(raw);
   switch (raw.status) {
@@ -258,10 +258,10 @@ function toResourceUsage(
 }
 
 /**
- * Holds the per-host usage cache and in-flight reads behind the RPC handlers;
- * a class keeps each step a small, separately judged method.
+ * Holds per-host usage cache and in-flight coalescing state; exported so smoke
+ * scenarios can verify server-side caching, refresh queuing, and label mapping.
  */
-class UsageSource {
+export class UsageSource {
   private readonly lastObserved = new Map<string, ResourceUsage>();
   private readonly inFlight = new Map<
     string,
@@ -275,11 +275,11 @@ class UsageSource {
     this.bb = bb;
   }
 
-  /** Only this plugin's own provider row counts; a same-id provider from another plugin does not. */
+  /** Prevents colliding with a same-id provider contributed by another plugin. */
   private isOwnProvider = (provider: ProviderRow): boolean =>
     provider.id === PROVIDER_ID && provider.pluginId === this.bb.pluginId;
 
-  /** Lists one usage resource per host that runs this provider, and drops cache for gone hosts. */
+  /** Evicts cached state for removed hosts so disconnected cards do not leak memory. */
   async listResources() {
     const hosts = await this.bb.sdk.hosts.list();
     const perHost = await Promise.all(
@@ -366,8 +366,8 @@ class UsageSource {
   }
 
   /**
-   * Reads one host's usage: checks the host and provider still exist, serves
-   * a fresh cache entry, otherwise asks the host bridge.
+   * Separates host existence checks, TTL caching, and bridge error recovery from
+   * pure payload transformation so transient RPC failures preserve `observedAt`.
    */
   private async load(id: string, refresh: boolean): Promise<ResourceUsage> {
     const startedAt = Date.now();
