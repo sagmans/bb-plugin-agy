@@ -113,14 +113,40 @@ export const usageSourceContract = defineRpcContract({
 type ResourceUsage = z.output<typeof resourceUsageSchema>;
 
 /** Isolates the bridge wire payload from the public `provider-usage.v1` RPC schema. */
-type BridgeUsage = NonNullable<
+export type BridgeUsage = NonNullable<
   Awaited<ReturnType<BbPluginApi["sdk"]["system"]["usageLimits"]>>[string]
 >;
 
-/** Avoids repeating SDK return inference across host-provider filter helpers. */
-type ProviderRow = Awaited<
-  ReturnType<BbPluginApi["sdk"]["providers"]["list"]>
->[number];
+/** Narrow host summary required by `UsageSource` so smoke scenarios need no full SDK stub. */
+export interface UsageHostSummary {
+  readonly id: string;
+  readonly name: string;
+  readonly status: string;
+}
+
+/** Narrow provider summary required to filter this plugin's own provider row. */
+export interface UsageProviderSummary {
+  readonly id: string;
+  readonly pluginId?: string | null;
+  readonly displayName: string;
+}
+
+/** Minimal SDK surface consumed by `UsageSource` for decoupled verification. */
+export interface UsageSourceBackend {
+  readonly pluginId: string;
+  readonly logWarn: (message: string) => void;
+  readonly listHosts: () => Promise<readonly UsageHostSummary[]>;
+  readonly getHost: (args: { hostId: string }) => Promise<UsageHostSummary>;
+  readonly listProviders: (args: {
+    hostId: string;
+    capability: "usage";
+  }) => Promise<readonly UsageProviderSummary[]>;
+  readonly readUsageLimits: (args: {
+    hostId: string;
+    providerId: string;
+    refresh: boolean;
+  }) => Promise<Readonly<Record<string, BridgeUsage | undefined>>>;
+}
 
 const bridgeWindowSchema = z
   .object({
@@ -267,24 +293,24 @@ export class UsageSource {
     string,
     { readonly refresh: boolean; readonly promise: Promise<ResourceUsage> }
   >();
-  private readonly bb: BbPluginApi;
+  private readonly backend: UsageSourceBackend;
 
   // An explicit field, not a parameter property: Node's type stripping
   // (used by the smoke script) rejects parameter properties.
-  constructor(bb: BbPluginApi) {
-    this.bb = bb;
+  constructor(backend: UsageSourceBackend) {
+    this.backend = backend;
   }
 
   /** Prevents colliding with a same-id provider contributed by another plugin. */
-  private isOwnProvider = (provider: ProviderRow): boolean =>
-    provider.id === PROVIDER_ID && provider.pluginId === this.bb.pluginId;
+  private isOwnProvider = (provider: UsageProviderSummary): boolean =>
+    provider.id === PROVIDER_ID && provider.pluginId === this.backend.pluginId;
 
   /** Evicts cached state for removed hosts so disconnected cards do not leak memory. */
   async listResources() {
-    const hosts = await this.bb.sdk.hosts.list();
+    const hosts = await this.backend.listHosts();
     const perHost = await Promise.all(
       hosts.map(async (host) => {
-        const providers = await this.bb.sdk.providers.list({
+        const providers = await this.backend.listProviders({
           hostId: host.id,
           capability: "usage",
         });
@@ -340,8 +366,8 @@ export class UsageSource {
    * bb drops the card instead of showing a stale one.
    */
   private async assertResourceExists(hostId: string): Promise<boolean> {
-    const host = await this.bb.sdk.hosts
-      .get({ hostId })
+    const host = await this.backend
+      .getHost({ hostId })
       .catch((error: unknown) => {
         if (
           error instanceof Error &&
@@ -355,7 +381,7 @@ export class UsageSource {
     if (host.status === "disconnected") {
       return false;
     }
-    const providers = await this.bb.sdk.providers.list({
+    const providers = await this.backend.listProviders({
       hostId,
       capability: "usage",
     });
@@ -382,7 +408,7 @@ export class UsageSource {
     }
 
     try {
-      const response = await this.bb.sdk.system.usageLimits({
+      const response = await this.backend.readUsageLimits({
         hostId,
         providerId: PROVIDER_ID,
         refresh,
@@ -396,7 +422,7 @@ export class UsageSource {
       return result;
     } catch (error) {
       const elapsedMs = Date.now() - startedAt;
-      this.bb.log.warn(
+      this.backend.logWarn(
         `op=${COLLECT_OPERATION} hostId=${hostId} providerId=${PROVIDER_ID} ` +
           `refresh=${refresh} elapsedMs=${elapsedMs} ` +
           `cause=${error instanceof Error ? error.message : String(error)}`,
@@ -422,7 +448,14 @@ function isFresh(
  * request coalescing; called once from the server entry.
  */
 export function registerUsageSource(bb: BbPluginApi): void {
-  const source = new UsageSource(bb);
+  const source = new UsageSource({
+    pluginId: bb.pluginId,
+    logWarn: (message) => bb.log.warn(message),
+    listHosts: () => bb.sdk.hosts.list(),
+    getHost: (args) => bb.sdk.hosts.get(args),
+    listProviders: (args) => bb.sdk.providers.list(args),
+    readUsageLimits: (args) => bb.sdk.system.usageLimits(args),
+  });
   bb.rpc.register(
     usageSourceContract,
     {
