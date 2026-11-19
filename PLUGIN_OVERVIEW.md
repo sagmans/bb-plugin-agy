@@ -15,10 +15,10 @@ typeahead, and quota visibility as built-in providers.
   Antigravity mark across sidebar thread rows, new-thread and follow-up
   composer pickers, thread headers, **Settings -> Providers**, **Settings ->
   Installed plugins**, and both **Provider usage** surfaces.
-- **Live quota windows:** Displays `7d · Gemini`, `5h · Gemini`,
-  `7d · Claude/GPT`, and `5h · Claude/GPT` usage bars and reset times in
-  **Settings -> Provider usage**, the sidebar usage card, and
-  `bb settings usage`.
+- **Live quota windows:** Tracks `Gemini` and `Claude/GPT` weekly and five-hour
+  quota bars and reset times across the sidebar usage card (`7d · …`, `5h · …`),
+  **Settings -> Provider usage**, and `bb settings usage` (`Weekly · …`,
+  `5h · …`).
 
 ## How it works
 

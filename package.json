@@ -1,8 +1,8 @@
 {
   "name": "bb-plugin-agy",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "bb plugin that runs Google Antigravity (agy) as a first-class agent provider, with full-colour branding and live quota usage.",
+  "description": "bb plugin that runs Google Antigravity (agy) as a first-class agent provider, with multicolor branding, live quota usage, and configurable auto-compaction.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -28,7 +28,7 @@
   },
   "bb": {
     "name": "Antigravity",
-    "description": "Run bb threads with Google Antigravity (agy) with official multicolor branding and Provider usage quota.",
+    "description": "Run bb threads with Google Antigravity (agy) with official multicolor branding, Provider usage quota, and configurable auto-compaction.",
     "branding": {
       "icon": "./icons/antigravity.svg",
       "logo": {

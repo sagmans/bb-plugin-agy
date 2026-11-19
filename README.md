@@ -1,21 +1,33 @@
 # bb-plugin-agy
 
 A [bb](https://github.com/get-bb/bb) plugin that runs Google Antigravity
-(`agy`) as a first-class agent provider. It shows the official multicolor
-Antigravity mark on every provider surface. It also shows live quota in bb's
-**Provider usage** page and sidebar card.
+(`agy`) as a first-class agent provider. It renders the official multicolor
+Antigravity mark across every provider surface, surfaces live host quota in
+**Provider usage**, and enforces configurable auto-compaction with automatic
+continuation.
 
-The plugin id and the provider id are both `agy`. This id is different from the
-`antigravity` plugin in the bb marketplace, so you can install both.
+The plugin id and the provider id are both `agy`. This id is distinct from the
+`antigravity` plugin in the bb marketplace, so both can be installed side by
+side.
 
 ## Requirements
 
 - bb `0.49` or later (`@get-bb/plugin-sdk` `0.6.132` or later).
-- Node.js `22.18` or later (runs the TypeScript scripts without a build step).
-- The `agy` CLI, installed and signed in (`agy acp --login`). Install
-  instructions: <https://antigravity.google/docs>.
+- A signed-in `agy` CLI installation on the machine hosting your threads
+  (`agy acp --login`). Install instructions: <https://antigravity.google/docs>.
+- Node.js `22.18` or later when running contributor TypeScript scripts locally
+  (`npm run smoke`, `npm run check`); bb itself runs built plugin bundles inside
+  its own runtime and does not enforce `engines.node`.
 
 ## Install
+
+Install directly from GitHub with bb:
+
+```sh
+bb plugin install https://github.com/sagmans/bb-plugin-agy
+```
+
+Or build and install from a local clone for development:
 
 ```sh
 git clone https://github.com/sagmans/bb-plugin-agy.git
@@ -34,23 +46,26 @@ bb plugin build . && bb plugin reload agy
 ## Architecture
 
 - **`server.ts`**: Registers the `agy` provider (models, reasoning levels, ACP
-  modes, `/compact`, native skill roots, sign-in hint), the `provider-usage.v1`
-  RPC source, and automatic compaction.
-- **`src/auto-compact.ts`, `src/auto-compact-policy.ts`**: Defines the
-  auto-compaction settings, inspects tool boundaries, compacts `agy` threads at
-  the configured token threshold, and automatically resumes active sessions.
-- **`app.tsx`**: Mounts the multicolor SVG on
-  `app.slots.experimental_providerIcon` and `app.experimental_icons`, with
-  per-instance `useId()` paint-server IDs.
-- **`host.ts`**: Runs bb's ACP provider bridge with the `agy` dialect.
-- **`src/dialect.ts`**: Supplies the sign-in command, account state, and cached
-  host-side quota reads.
-- **`src/usage.ts`**: Runs `agy -p /usage --output-format json` with a GUI
-  `PATH` fallback and explicit timeouts.
-- **`src/usage-source.ts`**: Serves `provider-usage.v1` with concurrent-call
-  deduplication and a `refresh` cache bypass.
-- **`src/constants.ts`, `src/icon-spec.ts`**: Shared constants and brand
-  geometry.
+  permission modes, `/compact`, native skill roots, sign-in hint), verifies
+  `bb.pluginId === "agy"`, and attaches quota RPCs and auto-compaction.
+- **`src/auto-compact.ts`, `src/auto-compact-client.ts`,
+  `src/auto-compact-state.ts`, `src/auto-compact-policy.ts`,
+  `src/auto-compact-events.ts`**: Defines auto-compaction settings, inspects
+  event boundaries, yields active turns safely between tool calls to compact and
+  immediately resume, and compacts idle threads in place.
+- **`app.tsx`, `src/icon-spec.ts`, `icons/*.svg`**: Mounts the multicolor SVG on
+  `app.slots.experimental_providerIcon` and `app.experimental_icons` with
+  instance-unique `useId()` paint-server IDs.
+- **`host.ts`, `src/dialect.ts`**: Registers the `agy` ACP dialect with
+  fail-closed `readAccount` health checks and unsettled-probe cache coalescing.
+- **`src/usage.ts`, `src/usage-exec.ts`**: Spawns
+  `agy -p /usage --output-format json` portably with GUI `PATH` fallbacks,
+  immediate stop on signed-out OAuth output, and typed failure classification.
+- **`src/usage-source.ts`, `src/usage-rpc-contract.ts`**: Defines the
+  `provider-usage.v1` schema and window mappers with 60-second passive caching,
+  concurrent request coalescing, and `refresh` queuing.
+- **`src/constants.ts`, `skills/agy-provider/SKILL.md`**: Shared constants and
+  bundled provider skill.
 
 ## Auto-compaction
 
@@ -80,24 +95,32 @@ bb plugin config agy set autoCompactTokenThreshold 250000
 
 ## Usage mapping
 
-Antigravity reports two model groups (`Gemini` and `Claude/GPT`). Each group
-has a weekly bucket and a five-hour bucket
-(`usedPercent = (1 - remaining_fraction) * 100`).
+Antigravity reports two model groups (`Gemini` and `Claude/GPT`), each with a
+weekly bucket and a five-hour bucket
+(`usedPercent = Math.round((1 - remaining_fraction) * 100)`):
+
+- **Sidebar usage card:** Abbreviates weekly windows to `7d · Gemini` and
+  `7d · Claude/GPT` alongside `5h · Gemini` and `5h · Claude/GPT`.
+- **Settings -> Provider usage:** Renders weekly windows with their model group
+  (`Weekly · Gemini`, `Weekly · Claude/GPT`) alongside `5h · Gemini` and
+  `5h · Claude/GPT` (`bb settings usage` prints raw host labels
+  `5 hours · …`).
 
 ## Development
 
 ```sh
 scripts/setup-hooks   # once per clone: turns on the repository Git hooks
-npm run check         # every check that the pre-push hook runs
-npm run smoke         # usage parser fixtures, plus a live read when signed in
+npm run check         # runs every lint, type, security, complexity, build, and smoke check
+npm run smoke         # subprocess, dialect, RPC, compaction, and SVG checks + live quota read
 ```
 
-The hooks need `gitleaks`, `semgrep`, `osv-scanner`, `lizard`,
-`markdownlint-cli2`, `shellcheck` and `shfmt` on `PATH`. A missing tool blocks
-the hook. All checks must pass before a push. Do not use `--no-verify`.
+`scripts/check` and `.githooks/pre-push` require `gitleaks`, `semgrep`,
+`osv-scanner`, `lizard`, `markdownlint-cli2`, `shellcheck`, and `shfmt` on
+`PATH`. A missing tool blocks the check. Do not use `--no-verify`.
 
 Commits are signed (`git commit -s -S`) and use Conventional Commits. See
-[`AGENTS.md`](AGENTS.md) for the project map and rules.
+[`AGENTS.md`](AGENTS.md) for contributor rules and [`SECURITY.md`](SECURITY.md)
+for security boundaries and vulnerability reporting.
 
 ## License
 
