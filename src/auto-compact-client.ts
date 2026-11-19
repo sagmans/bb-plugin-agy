@@ -9,15 +9,16 @@ import {
   AUTO_COMPACT_BOUNDARY_EVENT_TYPES,
   AUTO_COMPACT_ITEM_EVENT_TYPES,
   analyzeRecentThreadEvents,
+  mergeRecentThreadEvents,
+  type RecentThreadActivity,
+} from "./auto-compact-events.ts";
+import {
   autoCompactThresholdSchema,
   buildMidTurnYieldPrompt,
   buildPostCompactionResumePrompt,
   type ContextUsageSnapshot,
   contextUsageSchema,
-  mergeRecentThreadEvents,
-  type RecentThreadActivity,
 } from "./auto-compact-policy.ts";
-import { awaitWithTimeout } from "./auto-compact-state.ts";
 import {
   AUTO_COMPACT_BOUNDARY_EVENTS_LIMIT,
   AUTO_COMPACT_ENABLED_DEFAULT,
@@ -30,6 +31,7 @@ import {
   PROVIDER_ID,
 } from "./constants.ts";
 
+const ZERO_TIMEOUT_MS = 0 as const;
 const TRIGGER_IDLE_OPERATION = "auto-compact.trigger" as const;
 const TRIGGER_CONTINUE_OPERATION = "auto-compact.trigger-and-continue" as const;
 const MID_TURN_YIELD_OPERATION = "auto-compact.mid-turn-yield" as const;
@@ -54,6 +56,51 @@ const THRESHOLD_SETTING_DESCRIPTION =
 export interface ValidatedAutoCompactConfig {
   readonly enabled: true;
   readonly threshold: number;
+}
+
+/** Domain error raised when an SDK call without native AbortSignal exceeds its bound. */
+export class AutoCompactRequestTimeoutError extends Error {
+  constructor(operation: string, timeoutMs: number) {
+    super(`${operation} exceeded ${timeoutMs}ms timeout`);
+    this.name = "AutoCompactRequestTimeoutError";
+  }
+}
+
+/** Bounds RPCs whose SDK signature lacks a native AbortSignal so per-thread locks always release. */
+async function awaitWithTimeout<T>(
+  promise: Promise<T>,
+  lifecycleSignal: AbortSignal,
+  operation: string,
+  timeoutMs: number,
+): Promise<T> {
+  if (lifecycleSignal.aborted) {
+    throw new AutoCompactRequestTimeoutError(operation, ZERO_TIMEOUT_MS);
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        onAbort = () => {
+          reject(
+            new AutoCompactRequestTimeoutError(operation, ZERO_TIMEOUT_MS),
+          );
+        };
+        lifecycleSignal.addEventListener("abort", onAbort, { once: true });
+        timer = setTimeout(() => {
+          reject(new AutoCompactRequestTimeoutError(operation, timeoutMs));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    if (onAbort !== undefined) {
+      lifecycleSignal.removeEventListener("abort", onAbort);
+    }
+  }
 }
 
 /** Exposes user-tunable compaction controls in BB settings and `bb plugin config agy`. */
@@ -100,7 +147,7 @@ export class AutoCompactSdkClient {
     this.lifecycleSignal = lifecycleSignal;
   }
 
-  /** Combines plugin disposal with a hard per-request timeout. */
+  /** Ensures neither hung loopback RPCs nor plugin unload can leak background promises. */
   private requestSignal(timeoutMs: number): AbortSignal {
     return AbortSignal.any([
       this.lifecycleSignal,
@@ -108,7 +155,7 @@ export class AutoCompactSdkClient {
     ]);
   }
 
-  /** Reads and validates plugin settings, returning null when disabled or malformed. */
+  /** Rejects disabled or corrupted persisted thresholds at the settings boundary. */
   async readValidatedConfig(
     threadId: string,
   ): Promise<ValidatedAutoCompactConfig | null> {
@@ -129,7 +176,7 @@ export class AutoCompactSdkClient {
     return { enabled: true, threshold: parsedThreshold.data };
   }
 
-  /** Reads and validates the thread's latest persisted context window usage. */
+  /** Validates untrusted context-usage DTOs before comparing against user thresholds. */
   async readContextUsage(
     threadId: string,
   ): Promise<ContextUsageSnapshot | null> {
@@ -171,7 +218,37 @@ export class AutoCompactSdkClient {
     );
   }
 
-  /** Steers an active turn with an agent-only pause instruction at a safe step boundary. */
+  /** Centralizes agent-only prompt dispatch so yield and continuation share timeout bounds. */
+  private async sendAgentPrompt(
+    threadId: string,
+    operation: string,
+    options: {
+      readonly mode: typeof STEER_SEND_MODE | typeof START_SEND_MODE;
+      readonly compactFirst?: boolean;
+      readonly text: string;
+    },
+  ): Promise<void> {
+    await awaitWithTimeout(
+      this.bb.sdk.threads.send({
+        threadId,
+        mode: options.mode,
+        ...(options.compactFirst === true ? { compactFirst: true } : {}),
+        input: [
+          {
+            type: TEXT_BLOCK_TYPE,
+            text: options.text,
+            mentions: [],
+            visibility: AGENT_ONLY_VISIBILITY,
+          },
+        ],
+      }),
+      this.lifecycleSignal,
+      operation,
+      AUTO_COMPACT_REQUEST_TIMEOUT_MS,
+    );
+  }
+
+  /** Yields an active turn at a tool-free step boundary without killing the ACP process. */
   async sendMidTurnYield(
     threadId: string,
     turnSeq: number,
@@ -183,26 +260,13 @@ export class AutoCompactSdkClient {
         `turnSeq=${turnSeq} usedTokens=${usage.usedTokens} ` +
         `threshold=${threshold} modelContextWindow=${usage.modelContextWindow}`,
     );
-    await awaitWithTimeout(
-      this.bb.sdk.threads.send({
-        threadId,
-        mode: STEER_SEND_MODE,
-        input: [
-          {
-            type: TEXT_BLOCK_TYPE,
-            text: buildMidTurnYieldPrompt(usage.usedTokens, threshold),
-            mentions: [],
-            visibility: AGENT_ONLY_VISIBILITY,
-          },
-        ],
-      }),
-      this.lifecycleSignal,
-      MID_TURN_YIELD_OPERATION,
-      AUTO_COMPACT_REQUEST_TIMEOUT_MS,
-    );
+    await this.sendAgentPrompt(threadId, MID_TURN_YIELD_OPERATION, {
+      mode: STEER_SEND_MODE,
+      text: buildMidTurnYieldPrompt(usage.usedTokens, threshold),
+    });
   }
 
-  /** Starts an agent-only continuation turn gated behind `compactFirst: true`. */
+  /** Chains `compactFirst: true` with an agent-only turn so yielded sessions resume seamlessly. */
   async sendCompactAndContinue(
     threadId: string,
     usedTokens: number,
@@ -215,27 +279,14 @@ export class AutoCompactSdkClient {
         `usedTokens=${usedTokens} threshold=${threshold} ` +
         `modelContextWindow=${contextWindow} consecutive=${consecutive}`,
     );
-    await awaitWithTimeout(
-      this.bb.sdk.threads.send({
-        threadId,
-        mode: START_SEND_MODE,
-        compactFirst: true,
-        input: [
-          {
-            type: TEXT_BLOCK_TYPE,
-            text: buildPostCompactionResumePrompt(usedTokens, threshold),
-            mentions: [],
-            visibility: AGENT_ONLY_VISIBILITY,
-          },
-        ],
-      }),
-      this.lifecycleSignal,
-      TRIGGER_CONTINUE_OPERATION,
-      AUTO_COMPACT_REQUEST_TIMEOUT_MS,
-    );
+    await this.sendAgentPrompt(threadId, TRIGGER_CONTINUE_OPERATION, {
+      mode: START_SEND_MODE,
+      compactFirst: true,
+      text: buildPostCompactionResumePrompt(usedTokens, threshold),
+    });
   }
 
-  /** Triggers in-place compaction on an idle thread without restarting `agy`. */
+  /** Compacts idle threads in place so live background subagents keep running. */
   async sendIdleCompact(
     threadId: string,
     turnSeq: number,
@@ -253,7 +304,7 @@ export class AutoCompactSdkClient {
     });
   }
 
-  /** Records when a yielded turn was manually interrupted so resume is skipped. */
+  /** Leaves an audit trail when a manual user Stop cancels automatic post-yield continuation. */
   logYieldCancelled(threadId: string): void {
     this.bb.log.info(
       `op=${YIELD_CANCELLED_OPERATION} threadId=${threadId} providerId=${PROVIDER_ID}`,

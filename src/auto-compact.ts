@@ -13,6 +13,7 @@ import {
   defineAutoCompactSettings,
   type ValidatedAutoCompactConfig,
 } from "./auto-compact-client.ts";
+import type { RecentThreadActivity } from "./auto-compact-events.ts";
 import {
   type AutoCompactThreadCandidate,
   type ContextUsageSnapshot,
@@ -21,45 +22,64 @@ import {
   evaluateMidTurnAutoCompactDecision,
   isEligibleActiveAutoCompactThread,
   isEligibleIdleAutoCompactThread,
-  type RecentThreadActivity,
 } from "./auto-compact-policy.ts";
 import {
-  COMPACTING_IDLE_PHASE,
-  COMPACTING_RESUME_PHASE,
+  beginCompactAndResume,
+  beginIdleCompaction,
+  beginMidTurnYield,
   IDLE_PHASE,
-  recoverStalePhase,
   resetToIdlePhase,
+  rollbackMidTurnYield,
   syncStateWithActivity,
   type ThreadAutoCompactState,
   ThreadAutoCompactStore,
   YIELDING_PHASE,
 } from "./auto-compact-state.ts";
 
-export * from "./auto-compact-policy.ts";
-
 const ZERO_COUNT = 0 as const;
-const ONE_COUNT = 1 as const;
+
+/** Minimal transport contract consumed by `AutoCompactor` so smoke tests need no SDK stub. */
+export type AutoCompactorClient = Pick<
+  AutoCompactSdkClient,
+  | "readValidatedConfig"
+  | "readContextUsage"
+  | "readRecentActivity"
+  | "sendMidTurnYield"
+  | "sendCompactAndContinue"
+  | "sendIdleCompact"
+  | "logYieldCancelled"
+  | "logCheckError"
+>;
 
 /**
  * Coordinates per-thread deduplication, safe mid-turn yield + continuation,
- * and idle compaction across `agy` threads.
+ * and idle compaction across `agy` threads; exported for deterministic smoke tests.
  */
-class AutoCompactor {
-  private disposed = false;
-  private readonly lifecycle = new AbortController();
+export class AutoCompactor {
+  private readonly lifecycle: AbortController;
   private readonly inFlight = new Set<string>();
   private readonly pendingIdle = new Map<string, AutoCompactThreadCandidate>();
-  private readonly store = new ThreadAutoCompactStore();
-  private readonly client: AutoCompactSdkClient;
+  private readonly store: ThreadAutoCompactStore;
+  private readonly client: AutoCompactorClient;
 
   // Explicit field assignment keeps Node native type stripping compatible.
-  constructor(bb: BbPluginApi, settings: AutoCompactSettingsHandle) {
-    this.client = new AutoCompactSdkClient(bb, settings, this.lifecycle.signal);
+  constructor(
+    client: AutoCompactorClient,
+    lifecycle: AbortController,
+    store: ThreadAutoCompactStore = new ThreadAutoCompactStore(),
+  ) {
+    this.client = client;
+    this.lifecycle = lifecycle;
+    this.store = store;
+  }
+
+  /** Single disposal flag backed by `AbortController` so shutdown state cannot drift. */
+  private get isDisposed(): boolean {
+    return this.lifecycle.signal.aborted;
   }
 
   /** Aborts in-flight SDK calls and releases per-thread tracking on plugin unload. */
   dispose(): void {
-    this.disposed = true;
     this.lifecycle.abort();
     this.inFlight.clear();
     this.pendingIdle.clear();
@@ -74,52 +94,59 @@ class AutoCompactor {
 
   /** Clears transient compaction phases when a turn fails so recovery never stalls. */
   handleThreadFailed(threadId: string): void {
-    const state = this.store.peek(threadId);
+    const now = Date.now();
+    const state = this.store.peekFresh(threadId, now);
     if (state !== undefined && state.phase !== IDLE_PHASE) {
-      resetToIdlePhase(state, Date.now());
+      resetToIdlePhase(state, now);
     }
   }
 
   /** Evaluates active-turn events for safe mid-turn yield and seamless continuation. */
   async handleThreadEvents(thread: AutoCompactThreadCandidate): Promise<void> {
     if (
-      this.disposed ||
+      this.isDisposed ||
       !isEligibleActiveAutoCompactThread(thread) ||
       this.inFlight.has(thread.id)
     ) {
       return;
     }
-    this.inFlight.add(thread.id);
-    try {
-      await this.evaluateActiveThread(thread.id);
-    } finally {
-      this.inFlight.delete(thread.id);
-      this.flushPendingIdle(thread.id);
-    }
+    await this.runWithThreadLock(thread.id, () =>
+      this.evaluateActiveThread(thread.id),
+    );
   }
 
   /** Evaluates an idle transition: either compacts+continues a yielded turn or compacts idle state. */
   async handleThreadIdle(thread: AutoCompactThreadCandidate): Promise<void> {
-    if (this.disposed || !isEligibleIdleAutoCompactThread(thread)) {
+    if (this.isDisposed || !isEligibleIdleAutoCompactThread(thread)) {
       return;
     }
     if (this.inFlight.has(thread.id)) {
       this.pendingIdle.set(thread.id, thread);
       return;
     }
-    this.inFlight.add(thread.id);
+    await this.runWithThreadLock(thread.id, () =>
+      this.evaluateIdleThread(thread.id),
+    );
+  }
+
+  /** Serializes checks per thread and replays any idle transition that arrived mid-check. */
+  private async runWithThreadLock(
+    threadId: string,
+    task: () => Promise<void>,
+  ): Promise<void> {
+    this.inFlight.add(threadId);
     try {
-      await this.evaluateIdleThread(thread.id);
+      await task();
     } finally {
-      this.inFlight.delete(thread.id);
-      this.flushPendingIdle(thread.id);
+      this.inFlight.delete(threadId);
+      this.flushPendingIdle(threadId);
     }
   }
 
   /** Replays an idle notification that arrived while an active check held the per-thread lock. */
   private flushPendingIdle(threadId: string): void {
     const deferred = this.pendingIdle.get(threadId);
-    if (deferred === undefined || this.disposed) {
+    if (deferred === undefined || this.isDisposed) {
       return;
     }
     this.pendingIdle.delete(threadId);
@@ -138,9 +165,9 @@ class AutoCompactor {
     readonly activity: RecentThreadActivity;
     readonly usage: ContextUsageSnapshot;
   } | null> {
-    const existing = this.store.peek(threadId);
+    const existing = this.store.peekFresh(threadId, Date.now());
     const usage = await this.client.readContextUsage(threadId);
-    if (this.disposed) {
+    if (this.isDisposed) {
       return null;
     }
     const needsStateSync =
@@ -150,7 +177,7 @@ class AutoCompactor {
       return null;
     }
     const activity = await this.client.readRecentActivity(threadId);
-    if (this.disposed) {
+    if (this.isDisposed) {
       return null;
     }
     const now = Date.now();
@@ -176,12 +203,9 @@ class AutoCompactor {
       if (config === null) {
         return;
       }
-      const existing = this.store.peek(threadId);
-      if (existing !== undefined) {
-        recoverStalePhase(existing, Date.now());
-        if (existing.phase === YIELDING_PHASE) {
-          return;
-        }
+      const existing = this.store.peekFresh(threadId, Date.now());
+      if (existing?.phase === YIELDING_PHASE) {
+        return;
       }
       const context = await this.prepareCompactionContext(
         threadId,
@@ -215,7 +239,7 @@ class AutoCompactor {
     }
   }
 
-  /** Updates phase tracking around `sendMidTurnYield`, rolling back if steer fails. */
+  /** Rolls back turn-attempt tracking if `steer` fails so the next step boundary can retry. */
   private async dispatchMidTurnYield(
     threadId: string,
     state: ThreadAutoCompactState,
@@ -224,17 +248,11 @@ class AutoCompactor {
     usage: ContextUsageSnapshot,
     threshold: number,
   ): Promise<void> {
-    state.phase = YIELDING_PHASE;
-    state.phaseUpdatedAtMs = Date.now();
-    state.yieldSteerSeq = latestSeq;
-    state.yieldUsage = usage;
-    state.yieldThreshold = threshold;
-    state.lastAttemptedTurnSeq = turnSeq;
+    beginMidTurnYield(state, latestSeq, turnSeq, usage, threshold, Date.now());
     try {
       await this.client.sendMidTurnYield(threadId, turnSeq, usage, threshold);
     } catch (error) {
-      resetToIdlePhase(state, Date.now());
-      state.lastAttemptedTurnSeq = undefined;
+      rollbackMidTurnYield(state, Date.now());
       throw error;
     }
   }
@@ -247,17 +265,15 @@ class AutoCompactor {
     const startedAt = Date.now();
     try {
       const config = await this.client.readValidatedConfig(threadId);
-      const existing = this.store.peek(threadId);
-      if (existing !== undefined) {
-        recoverStalePhase(existing, Date.now());
-      }
+      const now = Date.now();
+      const existing = this.store.peekFresh(threadId, now);
       if (config === null) {
-        if (existing !== undefined && existing.phase === YIELDING_PHASE) {
-          resetToIdlePhase(existing, Date.now());
+        if (existing?.phase === YIELDING_PHASE) {
+          resetToIdlePhase(existing, now);
         }
         return;
       }
-      if (existing !== undefined && existing.phase === YIELDING_PHASE) {
+      if (existing?.phase === YIELDING_PHASE) {
         await this.completeYieldedMidTurnCompaction(
           threadId,
           existing,
@@ -281,7 +297,7 @@ class AutoCompactor {
     threshold: number,
   ): Promise<void> {
     const activity = await this.client.readRecentActivity(threadId);
-    if (this.disposed) {
+    if (this.isDisposed) {
       return;
     }
     if (!canResumeAfterMidTurnYield(activity, state.yieldSteerSeq)) {
@@ -290,21 +306,18 @@ class AutoCompactor {
       return;
     }
     const freshUsage = await this.client.readContextUsage(threadId);
-    if (this.disposed) {
+    if (this.isDisposed) {
       return;
     }
     const usage = freshUsage ?? state.yieldUsage;
     const effectiveThreshold = state.yieldThreshold ?? threshold;
     const usedTokens = usage?.usedTokens ?? effectiveThreshold;
     const contextWindow = usage?.modelContextWindow ?? ZERO_COUNT;
-
-    state.phase = COMPACTING_RESUME_PHASE;
-    state.phaseUpdatedAtMs = Date.now();
-    state.awaitingDropOrNewTurn = true;
-    state.lastCompactionSeq = activity.latestSeq;
-    state.consecutiveAutoCompactions += ONE_COUNT;
-    state.yieldUsage = null;
-    state.yieldThreshold = null;
+    const consecutive = beginCompactAndResume(
+      state,
+      activity.latestSeq,
+      Date.now(),
+    );
 
     try {
       await this.client.sendCompactAndContinue(
@@ -312,7 +325,7 @@ class AutoCompactor {
         usedTokens,
         effectiveThreshold,
         contextWindow,
-        state.consecutiveAutoCompactions,
+        consecutive,
       );
     } catch (error) {
       resetToIdlePhase(state, Date.now());
@@ -353,7 +366,7 @@ class AutoCompactor {
     );
   }
 
-  /** Updates phase tracking around `sendIdleCompact`, rolling back on failure. */
+  /** Resets phase to `idle` if `threads.compact` rejects so the tracker cannot wedge. */
   private async dispatchIdleCompaction(
     threadId: string,
     state: ThreadAutoCompactState,
@@ -362,11 +375,7 @@ class AutoCompactor {
     usage: ContextUsageSnapshot,
     threshold: number,
   ): Promise<void> {
-    state.phase = COMPACTING_IDLE_PHASE;
-    state.phaseUpdatedAtMs = Date.now();
-    state.awaitingDropOrNewTurn = true;
-    state.lastCompactionSeq = latestSeq;
-    state.lastAttemptedTurnSeq = turnSeq;
+    beginIdleCompaction(state, latestSeq, turnSeq, Date.now());
     try {
       await this.client.sendIdleCompact(threadId, turnSeq, usage, threshold);
     } catch (error) {
@@ -376,13 +385,23 @@ class AutoCompactor {
   }
 }
 
+/** Instantiates a live SDK-backed `AutoCompactor` wired to plugin settings. */
+function createLiveAutoCompactor(
+  bb: BbPluginApi,
+  settings: AutoCompactSettingsHandle,
+): AutoCompactor {
+  const lifecycle = new AbortController();
+  const client = new AutoCompactSdkClient(bb, settings, lifecycle.signal);
+  return new AutoCompactor(client, lifecycle);
+}
+
 /**
  * Registers the auto-compaction settings and thread lifecycle listeners;
  * called once from the server entry.
  */
 export function registerAutoCompaction(bb: BbPluginApi): void {
   const settings = defineAutoCompactSettings(bb);
-  const compactor = new AutoCompactor(bb, settings);
+  const compactor = createLiveAutoCompactor(bb, settings);
 
   bb.events.on("experimental_thread.events", ({ thread }) =>
     compactor.handleThreadEvents(thread),

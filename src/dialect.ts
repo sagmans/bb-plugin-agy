@@ -27,14 +27,21 @@ const EXPIRED_SESSION_MESSAGE =
 const NOT_INSTALLED_MESSAGE =
   "Antigravity CLI (`agy`) is not installed on this machine." as const;
 
+/** Non-ready probe outcomes that must fail closed to `"unknown"` in BB health checks. */
+export type AgyAccountProbeStatus =
+  | "unsupported"
+  | "expired"
+  | "not_installed"
+  | "error";
+
 /**
  * Raised when `readAccount` cannot confirm a healthy or signed-out state so
  * BB's `getAcpProviderHealth` fails closed to `"unknown"` instead of `"ready"`.
  */
 export class AgyAccountProbeError extends Error {
-  readonly status: string;
+  readonly status: AgyAccountProbeStatus;
 
-  constructor(message: string, status: string) {
+  constructor(message: string, status: AgyAccountProbeStatus) {
     super(message);
     this.name = "AgyAccountProbeError";
     this.status = status;
@@ -48,18 +55,17 @@ export interface AntigravityDialectDeps {
     command: string,
     env: NodeJS.ProcessEnv,
   ) => Promise<ProviderUsageResult>;
-  readonly env?: () => NodeJS.ProcessEnv;
   readonly now?: () => number;
   readonly cacheTtlMs?: number;
 }
 
 interface UsageCacheEntry {
-  readonly at: number;
+  at: number;
   settled: boolean;
   readonly value: Promise<ProviderUsageResult>;
 }
 
-/** Resolves `agy` via the SDK toolchain, logging unexpected lookup errors once. */
+/** Falls back to bare command lookup if SDK path inspection hits a permission error. */
 async function defaultResolveCommand(command: string): Promise<string | null> {
   return experimental_resolveExecutablePath(command).catch((error: unknown) => {
     console.error(
@@ -96,15 +102,14 @@ function accountFromUsageResult(
 
 /**
  * Builds an isolated Antigravity ACP dialect instance whose cache reuses any
- * unsettled in-flight probe (preventing duplicate `agy` spawns when a probe
- * runs past the 10 s TTL) and guards eviction by entry identity.
+ * unsettled in-flight probe, starts the post-probe TTL on completion rather
+ * than launch, and guards eviction by entry identity.
  */
 export function createAntigravityDialect(
   deps: AntigravityDialectDeps = {},
 ): AcpDialect {
   const resolveCommand = deps.resolveCommand ?? defaultResolveCommand;
   const readUsage = deps.readUsage ?? readAgyUsage;
-  const getEnv = deps.env ?? (() => process.env);
   const getNow = deps.now ?? Date.now;
   const cacheTtlMs = deps.cacheTtlMs ?? BRIDGE_USAGE_CACHE_TTL_MS;
 
@@ -121,7 +126,7 @@ export function createAntigravityDialect(
 
     const probe = (async () => {
       const resolved = (await resolveCommand(AGY_COMMAND)) ?? AGY_COMMAND;
-      return readUsage(resolved, getEnv());
+      return readUsage(resolved, process.env);
     })();
     const entry: UsageCacheEntry = {
       at: timestamp,
@@ -129,22 +134,22 @@ export function createAntigravityDialect(
       value: probe,
     };
     cached = entry;
-    probe.then(
-      (result) => {
+
+    const evictIfCurrent = () => {
+      entry.settled = true;
+      if (cached === entry) {
+        cached = null;
+      }
+    };
+
+    probe.then((result) => {
+      if (result.supported && result.usage.status === "ok") {
         entry.settled = true;
-        if (!result.supported || result.usage.status !== "ok") {
-          if (cached === entry) {
-            cached = null;
-          }
-        }
-      },
-      () => {
-        entry.settled = true;
-        if (cached === entry) {
-          cached = null;
-        }
-      },
-    );
+        entry.at = getNow();
+        return;
+      }
+      evictIfCurrent();
+    }, evictIfCurrent);
     return entry.value;
   };
 

@@ -247,3 +247,6 @@ export const AUTO_COMPACT_PHASE_TIMEOUT_MS = 180_000 as const;
  * inspection distinguishes them from user-initiated prompts even after reload.
  */
 export const AUTO_COMPACT_MESSAGE_PREFIX = "[bb-plugin-agy] " as const;
+
+/** Matches BB's HTTP 404 host-lookup error status when a host is removed. */
+export const HTTP_NOT_FOUND = 404 as const;

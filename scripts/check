@@ -9,12 +9,35 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 # shellcheck source=.githooks/lib/helpers.sh
 . "$root/.githooks/lib/helpers.sh"
+
+# Covers unstaged diffs and untracked working-tree files while failing closed on gitleaks ERR output.
+scan_worktree_secrets() {
+	local stderr_file
+	stderr_file=$(mktemp "${TMPDIR:-/tmp}/check-secrets.XXXXXX")
+	# shellcheck disable=SC2064
+	trap "rm -f -- '$stderr_file'" RETURN
+	local rc=0
+	gitleaks git --pre-commit --config .githooks/lib/gitleaks.toml --redact --no-banner --log-level warn . 2>"$stderr_file" || rc=$?
+	cat "$stderr_file" >&2
+	if [[ "$rc" -eq 0 ]] && grep -q 'ERR' "$stderr_file"; then
+		echo >&2 "❌ secret scan: gitleaks reported an error on unstaged diff"
+		return 1
+	fi
+	[[ "$rc" -eq 0 ]] || return "$rc"
+	local file
+	while IFS= read -r -d '' file; do
+		[[ -f "$file" ]] || continue
+		gitleaks file --config .githooks/lib/gitleaks.toml --redact --no-banner --log-level warn "$file"
+	done < <(git ls-files -z --others --exclude-standard)
+}
+
 # Only disposable at_sha worktrees need installation; never replace a clone's dependencies.
 if [[ ! -d node_modules ]]; then
 	run_step 'locked dependencies' "$network_timeout" npm ci --ignore-scripts
 fi
-run_step 'secret scan (history)' "$local_timeout" gitleaks git --config .githooks/lib/gitleaks.toml --redact --no-banner --log-level warn .
-run_step 'secret scan (working tree)' "$local_timeout" gitleaks git --pre-commit --config .githooks/lib/gitleaks.toml --redact --no-banner --log-level warn .
+run_step 'secret scan (history)' "$local_timeout" bash .githooks/lib/checks/secrets.sh range HEAD --all
+run_step 'secret scan (staged)' "$local_timeout" bash .githooks/lib/checks/secrets.sh staged
+run_step 'secret scan (worktree)' "$local_timeout" scan_worktree_secrets
 run_step 'format and lint' "$local_timeout" npm run lint
 run_step 'typecheck' "$local_timeout" npm run typecheck
 run_step 'duplication' "$local_timeout" npm run duplicates
@@ -25,7 +48,7 @@ run_step 'dependency audit (osv)' "$network_timeout" osv-scanner scan source --n
 run_step 'build' "$local_timeout" npm run build
 run_step 'shell analysis' "$local_timeout" shellcheck -x scripts/setup-hooks scripts/check .githooks/pre-commit.d/* .githooks/pre-push.d/*
 run_step 'shell format' "$local_timeout" shfmt -d scripts/check .githooks/pre-commit.d .githooks/pre-push.d
-run_step 'markdown' "$local_timeout" markdownlint-cli2 README.md PLUGIN_OVERVIEW.md AGENTS.md skills/agy-provider/SKILL.md
+run_step 'markdown' "$local_timeout" markdownlint-cli2 README.md PLUGIN_OVERVIEW.md AGENTS.md SECURITY.md skills/agy-provider/SKILL.md
 # Exercises offline fixtures, real subprocess failure budgets, RPC/dialect contracts, and live quota.
 run_step 'usage smoke' "$local_timeout" npm run smoke
 printf 'All project checks passed.\n'

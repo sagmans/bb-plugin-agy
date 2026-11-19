@@ -1,20 +1,24 @@
 /**
  * Exercises live GUI-PATH quota probing, parser edge cases, portable subprocess
  * failure kinds (`not-installed`, fast signed-out exit, timeout, external
- * `SIGTERM`, and output cap), plus dialect, server `UsageSource`, compaction,
- * and SVG parity scenarios so regressions fail the check gate deterministically.
+ * `SIGTERM`, and multi-chunk output cap), plus dialect, server `UsageSource`,
+ * compaction, and SVG parity scenarios so regressions fail deterministically.
  */
 
 import { AGY_COMMAND, USER_RELATIVE_BIN_DIRS } from "../src/constants.ts";
 import {
-  buildPortableCliEnv,
+  GENERIC_USAGE_FAILURE_MESSAGE,
+  OVERSIZED_USAGE_MESSAGE,
   parseAgyUsage,
   readAgyUsage,
+  TIMED_OUT_USAGE_MESSAGE,
 } from "../src/usage.ts";
+import { buildPortableCliEnv } from "../src/usage-exec.ts";
 import { runComponentSmokeScenarios } from "./smoke-scenarios.ts";
 
 const CLI_ARG_INDEX = 2 as const;
 const JSON_INDENT = 2 as const;
+const FAILURE_EXIT_CODE = 1 as const;
 const MINIMAL_GUI_PATH = "/usr/bin:/bin" as const;
 const MISSING_BINARY_NAME = "agy-missing-binary-smoke-probe" as const;
 const FAST_SIGNED_OUT_LIMIT_MS = 2_500 as const;
@@ -85,19 +89,10 @@ const EXPECTED_SUCCESS_WINDOWS = [
   { label: "5 hours · Claude/GPT", usedPercent: 100 },
 ] as const;
 
-const failures: string[] = [];
-
-/** Records a failed expectation so the smoke suite exits non-zero at completion. */
-function expect(name: string, passed: boolean, detail: unknown): void {
-  console.log(JSON.stringify({ case: name, passed, detail }));
-  if (!passed) {
-    failures.push(name);
-  }
-}
-
 /** Exercises real child-process failure classifications via portable spawning. */
 async function runSubprocessScenarios(
   minimalGuiEnv: NodeJS.ProcessEnv,
+  expect: (name: string, passed: boolean, detail: unknown) => void,
 ): Promise<void> {
   const missingResult = await readAgyUsage(MISSING_BINARY_NAME, minimalGuiEnv);
   expect(
@@ -135,7 +130,7 @@ async function runSubprocessScenarios(
     "subprocess-timeout",
     timedOutResult.supported &&
       timedOutResult.usage.status === "error" &&
-      timedOutResult.usage.message.includes("did not answer in time"),
+      timedOutResult.usage.message === TIMED_OUT_USAGE_MESSAGE,
     timedOutResult,
   );
 
@@ -151,86 +146,103 @@ async function runSubprocessScenarios(
     "subprocess-external-sigterm",
     externalSignalResult.supported &&
       externalSignalResult.usage.status === "error" &&
-      externalSignalResult.usage.message ===
-        "agy could not report usage on this machine.",
+      externalSignalResult.usage.message === GENERIC_USAGE_FAILURE_MESSAGE,
     externalSignalResult,
   );
 
+  const oversizedStartedAt = Date.now();
   const oversizedResult = await readAgyUsage(process.execPath, process.env, {
-    args: ["-e", "process.stdout.write('x'.repeat(1024));"],
+    args: [
+      "-e",
+      "process.stdout.on('error', () => {}); for (let i = 0; i < 16; i += 1) { process.stdout.write('x'.repeat(256)); } setTimeout(() => {}, 2000);",
+    ],
     maxBufferBytes: SMALL_MAX_BUFFER_BYTES,
     timeoutMs: SUBPROCESS_DEADLINE_MS,
   });
+  const oversizedElapsedMs = Date.now() - oversizedStartedAt;
   expect(
     "subprocess-max-buffer",
     oversizedResult.supported &&
       oversizedResult.usage.status === "error" &&
-      oversizedResult.usage.message ===
-        "agy returned more usage output than bb accepts.",
-    oversizedResult,
+      oversizedResult.usage.message === OVERSIZED_USAGE_MESSAGE &&
+      oversizedElapsedMs < FAST_SIGNED_OUT_LIMIT_MS,
+    { result: oversizedResult, elapsedMs: oversizedElapsedMs },
   );
 }
 
-const command = process.argv[CLI_ARG_INDEX] ?? AGY_COMMAND;
-const minimalGuiEnv: NodeJS.ProcessEnv = {
-  ...process.env,
-  PATH: MINIMAL_GUI_PATH,
-};
-const [firstUserBinDir] = USER_RELATIVE_BIN_DIRS;
-const liveStartedAt = Date.now();
-const liveResult = await readAgyUsage(command, minimalGuiEnv);
-console.log(
-  JSON.stringify(
+/** Runs live GUI-PATH verification followed by deterministic offline scenarios. */
+async function main(): Promise<void> {
+  const failures: string[] = [];
+  const expect = (name: string, passed: boolean, detail: unknown): void => {
+    console.log(JSON.stringify({ case: name, passed, detail }));
+    if (!passed) {
+      failures.push(name);
+    }
+  };
+
+  const command = process.argv[CLI_ARG_INDEX] ?? AGY_COMMAND;
+  const minimalGuiEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: MINIMAL_GUI_PATH,
+  };
+  const [firstUserBinDir] = USER_RELATIVE_BIN_DIRS;
+  const liveStartedAt = Date.now();
+  const liveResult = await readAgyUsage(command, minimalGuiEnv);
+  console.log(
+    JSON.stringify(
+      {
+        case: "live-minimal-gui-path",
+        resolvedPathContainsUserBin: (
+          buildPortableCliEnv(minimalGuiEnv).PATH ?? ""
+        ).includes(firstUserBinDir ?? ""),
+        elapsedMs: Date.now() - liveStartedAt,
+        result: liveResult,
+      },
+      null,
+      JSON_INDENT,
+    ),
+  );
+
+  for (const { name, fixture, expectedStatus } of [
     {
-      case: "live-minimal-gui-path",
-      resolvedPathContainsUserBin: (
-        buildPortableCliEnv(minimalGuiEnv).PATH ?? ""
-      ).includes(firstUserBinDir ?? ""),
-      elapsedMs: Date.now() - liveStartedAt,
-      result: liveResult,
+      name: "signed-out",
+      fixture: SIGNED_OUT_FIXTURE,
+      expectedStatus: "unauthenticated",
     },
-    null,
-    JSON_INDENT,
-  ),
-);
+    { name: "garbage", fixture: GARBAGE_FIXTURE, expectedStatus: "error" },
+    {
+      name: "failed-status",
+      fixture: FAILED_STATUS_FIXTURE,
+      expectedStatus: "error",
+    },
+    { name: "success", fixture: SUCCESS_FIXTURE, expectedStatus: "ok" },
+  ] as const) {
+    const result = parseAgyUsage(fixture);
+    const status = result.supported ? result.usage.status : "unsupported";
+    expect(name, status === expectedStatus, result);
+  }
 
-for (const { name, fixture, expectedStatus } of [
-  {
-    name: "signed-out",
-    fixture: SIGNED_OUT_FIXTURE,
-    expectedStatus: "unauthenticated",
-  },
-  { name: "garbage", fixture: GARBAGE_FIXTURE, expectedStatus: "error" },
-  {
-    name: "failed-status",
-    fixture: FAILED_STATUS_FIXTURE,
-    expectedStatus: "error",
-  },
-  { name: "success", fixture: SUCCESS_FIXTURE, expectedStatus: "ok" },
-] as const) {
-  const result = parseAgyUsage(fixture);
-  const status = result.supported ? result.usage.status : "unsupported";
-  expect(name, status === expectedStatus, result);
+  const success = parseAgyUsage(SUCCESS_FIXTURE);
+  const windows =
+    success.supported && success.usage.status === "ok"
+      ? success.usage.windows.map(({ label, usedPercent }) => ({
+          label,
+          usedPercent,
+        }))
+      : [];
+  expect(
+    "success-windows",
+    JSON.stringify(windows) === JSON.stringify(EXPECTED_SUCCESS_WINDOWS),
+    windows,
+  );
+
+  await runSubprocessScenarios(minimalGuiEnv, expect);
+  await runComponentSmokeScenarios(expect);
+
+  if (failures.length > 0) {
+    console.error(`smoke-usage: failed cases: ${failures.join(", ")}`);
+    process.exitCode = FAILURE_EXIT_CODE;
+  }
 }
 
-const success = parseAgyUsage(SUCCESS_FIXTURE);
-const windows =
-  success.supported && success.usage.status === "ok"
-    ? success.usage.windows.map(({ label, usedPercent }) => ({
-        label,
-        usedPercent,
-      }))
-    : [];
-expect(
-  "success-windows",
-  JSON.stringify(windows) === JSON.stringify(EXPECTED_SUCCESS_WINDOWS),
-  windows,
-);
-
-await runSubprocessScenarios(minimalGuiEnv);
-await runComponentSmokeScenarios(expect);
-
-if (failures.length > 0) {
-  console.error(`smoke-usage: failed cases: ${failures.join(", ")}`);
-  process.exitCode = 1;
-}
+await main();

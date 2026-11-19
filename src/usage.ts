@@ -17,44 +17,39 @@ import {
 } from "./constants.ts";
 import {
   AgyUsageError,
-  type AgyUsageErrorDetails,
   type AgyUsageFailureKind,
-  buildPortableCliEnv,
   type ReadAgyUsageOptions,
   runAgyUsage,
 } from "./usage-exec.ts";
-
-export {
-  AgyUsageError,
-  type AgyUsageErrorDetails,
-  type AgyUsageFailureKind,
-  buildPortableCliEnv,
-  type ReadAgyUsageOptions,
-};
 
 const SUCCESS_STATUS = "SUCCESS" as const;
 const WEEKLY_WINDOW_KEY = "weekly" as const;
 const FIVE_HOUR_WINDOW_KEY = "5h" as const;
 const WEEKLY_SORT_ORDER = 0 as const;
 const OTHER_SORT_ORDER = 1 as const;
+const MIN_FRACTION = 0 as const;
+const MAX_FRACTION = 1 as const;
 const PERCENT_MULTIPLIER = 100 as const;
 const MIN_PERCENT = 0 as const;
 const MAX_PERCENT = 100 as const;
+const NO_CAUSE_CODE = "none" as const;
 const NON_JSON_MESSAGE = "agy returned usage output that is not JSON." as const;
 const UNREADABLE_PAYLOAD_MESSAGE =
   "agy returned usage information bb could not read." as const;
-const GENERIC_EXEC_FAILURE_MESSAGE =
+
+/** Shared with smoke scenarios so expected user-facing error copy has one owner. */
+export const GENERIC_USAGE_FAILURE_MESSAGE =
   "agy could not report usage on this machine." as const;
-const OVERSIZED_OUTPUT_MESSAGE =
+export const OVERSIZED_USAGE_MESSAGE =
   "agy returned more usage output than bb accepts." as const;
-const TIMED_OUT_MESSAGE = `agy did not answer in time. Run \`${AGY_LOGIN_COMMAND}\` to sign in, then reload.`;
+export const TIMED_OUT_USAGE_MESSAGE = `agy did not answer in time. Run \`${AGY_LOGIN_COMMAND}\` to sign in, then reload.`;
 
 const bucketSchema = z
   .object({
     id: z.string().min(1),
     name: z.string().min(1),
     window: z.string().min(1),
-    remaining_fraction: z.number().min(0).max(1),
+    remaining_fraction: z.number().min(MIN_FRACTION).max(MAX_FRACTION),
     reset_time: z.string().min(1).nullish(),
   })
   .passthrough();
@@ -97,7 +92,7 @@ const GROUP_SHORT_NAMES: Readonly<Record<string, string>> = {
 
 /** Antigravity reports what is left; bb's bars show what is used, clamped to 0-100. */
 function usedPercent(bucket: UsageBucket): number {
-  const used = (1 - bucket.remaining_fraction) * PERCENT_MULTIPLIER;
+  const used = (MAX_FRACTION - bucket.remaining_fraction) * PERCENT_MULTIPLIER;
   return Math.round(Math.min(MAX_PERCENT, Math.max(MIN_PERCENT, used)));
 }
 
@@ -163,15 +158,15 @@ function usageError(message: string): ProviderUsageResult {
   };
 }
 
-/** Maps non-missing failure kinds to actionable user-facing messages. */
+/** Gives actionable recovery steps on timeouts and output caps without leaking internals. */
 function userMessageForFailure(failureKind: AgyUsageFailureKind): string {
   if (failureKind === "timeout") {
-    return TIMED_OUT_MESSAGE;
+    return TIMED_OUT_USAGE_MESSAGE;
   }
   if (failureKind === "max-buffer") {
-    return OVERSIZED_OUTPUT_MESSAGE;
+    return OVERSIZED_USAGE_MESSAGE;
   }
-  return GENERIC_EXEC_FAILURE_MESSAGE;
+  return GENERIC_USAGE_FAILURE_MESSAGE;
 }
 
 /**
@@ -195,7 +190,7 @@ export async function readAgyUsage(
       const causeCode =
         error.cause instanceof Error && "code" in error.cause
           ? String(error.cause.code)
-          : "none";
+          : NO_CAUSE_CODE;
       console.error(
         `${LOG_PREFIX} op=${error.details.operation} cmd=${error.details.command} ` +
           `failureKind=${error.details.failureKind} exitCode=${error.details.exitCode} ` +

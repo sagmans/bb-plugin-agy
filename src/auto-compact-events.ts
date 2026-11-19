@@ -24,20 +24,27 @@ const CLIENT_TURN_REQUESTED_EVENT = "client/turn/requested" as const;
 const THREAD_INTERRUPTED_EVENT = "system/thread/interrupted" as const;
 const PROVIDER_WARNING_EVENT = "provider/warning" as const;
 
+const REASONING_ITEM_TYPE = "reasoning" as const;
+const AGENT_MESSAGE_ITEM_TYPE = "agentMessage" as const;
+const USER_MESSAGE_ITEM_TYPE = "userMessage" as const;
 const COMPACTION_ITEM_TYPE = "compaction" as const;
 const COMPACTION_SKIPPED_WARNING = "compaction-skipped" as const;
 const COMPACT_COMMAND_NAME = "compact" as const;
 const COMPACT_COMMAND_TEXT = "/compact" as const;
 const AGENT_ONLY_VISIBILITY = "agent-only" as const;
 
+const COMPACT_REQUEST_KIND = "compact" as const;
+const USER_REQUEST_KIND = "user" as const;
+const IGNORED_REQUEST_KIND = "ignore" as const;
+
 /**
  * Item types that represent model output or user text rather than an executing
  * tool; steering during these items avoids aborting live commands or edits.
  */
 const NON_TOOL_ITEM_TYPES: ReadonlySet<string> = new Set([
-  "reasoning",
-  "agentMessage",
-  "userMessage",
+  REASONING_ITEM_TYPE,
+  AGENT_MESSAGE_ITEM_TYPE,
+  USER_MESSAGE_ITEM_TYPE,
   COMPACTION_ITEM_TYPE,
 ]);
 
@@ -126,6 +133,20 @@ export interface RecentThreadActivity {
   readonly hasOpenToolExecution: boolean;
 }
 
+interface ActivityAccumulator {
+  latestTurnStartedSeq: number | null;
+  latestTurnCompleted: { seq: number; status: string } | null;
+  latestCompactionBoundarySeq: number;
+  latestUsageEventSeq: number;
+  latestUserRequestSeq: number;
+  latestInterruptedSeq: number;
+  latestCompactRequestSeq: number;
+  insideCurrentTurn: boolean;
+  isCompactionTurn: boolean;
+  hasOpenToolExecution: boolean;
+  readonly completedItemIds: Set<string>;
+}
+
 /** Deduplicates overlapping boundary and item queries while preserving newest-first order. */
 export function mergeRecentThreadEvents(
   boundaryEvents: readonly RecentThreadEvent[],
@@ -178,29 +199,31 @@ function isPluginAutoCompactRequest(
   );
 }
 
-/** Separates human prompts from `/compact` and plugin turns to guard loop counters. */
+/** Separates human prompts from `/compact` and plugin/malformed events to guard loop counters. */
 function classifyClientRequest(
   data: unknown,
-): "compact" | "plugin" | "user" | "unknown" {
+):
+  | typeof COMPACT_REQUEST_KIND
+  | typeof USER_REQUEST_KIND
+  | typeof IGNORED_REQUEST_KIND {
   const parsed = clientTurnRequestedDataSchema.safeParse(data);
   if (!parsed.success) {
-    return "unknown";
+    return IGNORED_REQUEST_KIND;
   }
   const blocks = parsed.data.input ?? [];
   if (isCompactClientRequest(blocks)) {
-    return "compact";
+    return COMPACT_REQUEST_KIND;
   }
   if (isPluginAutoCompactRequest(parsed.data.originPluginId, blocks)) {
-    return "plugin";
+    return IGNORED_REQUEST_KIND;
   }
-  return "user";
+  return USER_REQUEST_KIND;
 }
 
 /** Prevents steering while a tool item started in the active turn is still unfinished. */
 function inspectTurnItemEvent(
   event: RecentThreadEvent,
-  completedItemIds: Set<string>,
-  state: { isCompactionTurn: boolean; hasOpenToolExecution: boolean },
+  acc: ActivityAccumulator,
 ): void {
   const parsed = itemEventDataSchema.safeParse(event.data);
   if (!parsed.success) {
@@ -208,14 +231,14 @@ function inspectTurnItemEvent(
   }
   const { id, type } = parsed.data.item;
   if (type === COMPACTION_ITEM_TYPE) {
-    state.isCompactionTurn = true;
+    acc.isCompactionTurn = true;
   }
   if (event.type === ITEM_COMPLETED_EVENT) {
-    completedItemIds.add(id);
+    acc.completedItemIds.add(id);
     return;
   }
-  if (!completedItemIds.has(id) && !NON_TOOL_ITEM_TYPES.has(type)) {
-    state.hasOpenToolExecution = true;
+  if (!acc.completedItemIds.has(id) && !NON_TOOL_ITEM_TYPES.has(type)) {
+    acc.hasOpenToolExecution = true;
   }
 }
 
@@ -232,22 +255,6 @@ function isCompactionBoundaryEvent(event: RecentThreadEvent): boolean {
   }
   const parsed = warningDataSchema.safeParse(event.data);
   return parsed.success && parsed.data.category === COMPACTION_SKIPPED_WARNING;
-}
-
-interface ActivityAccumulator {
-  latestTurnStartedSeq: number | null;
-  latestTurnCompleted: { seq: number; status: string } | null;
-  latestCompactionBoundarySeq: number;
-  latestUsageEventSeq: number;
-  latestUserRequestSeq: number;
-  latestInterruptedSeq: number;
-  latestCompactRequestSeq: number;
-  insideCurrentTurn: boolean;
-  readonly completedItemIds: Set<string>;
-  readonly turnItems: {
-    isCompactionTurn: boolean;
-    hasOpenToolExecution: boolean;
-  };
 }
 
 /** Closes the active-turn item window once a prior `turn/completed` boundary is reached. */
@@ -271,9 +278,9 @@ function recordClientRequest(
   acc: ActivityAccumulator,
 ): void {
   const kind = classifyClientRequest(event.data);
-  if (kind === "user") {
+  if (kind === USER_REQUEST_KIND) {
     acc.latestUserRequestSeq = Math.max(acc.latestUserRequestSeq, event.seq);
-  } else if (kind === "compact") {
+  } else if (kind === COMPACT_REQUEST_KIND) {
     acc.latestCompactRequestSeq = Math.max(
       acc.latestCompactRequestSeq,
       event.seq,
@@ -281,7 +288,10 @@ function recordClientRequest(
   }
 }
 
-/** Folds one descending event row into turn and compaction boundary watermarks. */
+/**
+ * Stops inspecting tool items once `turn/started` or `turn/completed` is crossed
+ * in descending order so items from earlier turns never block the active turn.
+ */
 function recordRecentEvent(
   event: RecentThreadEvent,
   acc: ActivityAccumulator,
@@ -303,7 +313,7 @@ function recordRecentEvent(
     case ITEM_STARTED_EVENT:
     case ITEM_COMPLETED_EVENT:
       if (acc.insideCurrentTurn) {
-        inspectTurnItemEvent(event, acc.completedItemIds, acc.turnItems);
+        inspectTurnItemEvent(event, acc);
       }
       return;
     case CONTEXT_USAGE_UPDATED_EVENT:
@@ -322,7 +332,8 @@ function recordRecentEvent(
 
 /**
  * Summarizes a descending (`order: "desc"`) window of non-delta events into
- * the boundary facts needed for safe mid-turn and post-turn decisions.
+ * the boundary facts needed for safe mid-turn and post-turn decisions without
+ * scanning full thread histories.
  */
 export function analyzeRecentThreadEvents(
   events: readonly RecentThreadEvent[],
@@ -336,8 +347,9 @@ export function analyzeRecentThreadEvents(
     latestInterruptedSeq: ZERO_COUNT,
     latestCompactRequestSeq: ZERO_COUNT,
     insideCurrentTurn: true,
+    isCompactionTurn: false,
+    hasOpenToolExecution: false,
     completedItemIds: new Set<string>(),
-    turnItems: { isCompactionTurn: false, hasOpenToolExecution: false },
   };
   for (const event of events) {
     recordRecentEvent(event, acc);
@@ -353,7 +365,7 @@ export function analyzeRecentThreadEvents(
     latestUsageEventSeq: acc.latestUsageEventSeq,
     latestUserRequestSeq: acc.latestUserRequestSeq,
     latestInterruptedSeq: acc.latestInterruptedSeq,
-    isCompactionTurn: acc.turnItems.isCompactionTurn || pendingCompactRequest,
-    hasOpenToolExecution: acc.turnItems.hasOpenToolExecution,
+    isCompactionTurn: acc.isCompactionTurn || pendingCompactRequest,
+    hasOpenToolExecution: acc.hasOpenToolExecution,
   };
 }

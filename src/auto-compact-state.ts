@@ -1,13 +1,11 @@
 /**
- * Manages bounded per-thread auto-compaction phases, stale-phase recovery, and
- * timeout-guarded RPC waits so server memory stays capped and stalled host
- * operations never permanently wedge a thread's compaction tracker.
+ * Manages bounded per-thread auto-compaction phases and stale-phase recovery so
+ * server memory stays capped and missed lifecycle events never permanently
+ * wedge a thread's compaction tracker.
  */
 
-import type {
-  ContextUsageSnapshot,
-  RecentThreadActivity,
-} from "./auto-compact-policy.ts";
+import type { RecentThreadActivity } from "./auto-compact-events.ts";
+import type { ContextUsageSnapshot } from "./auto-compact-policy.ts";
 import {
   AUTO_COMPACT_MAX_TRACKED_THREADS,
   AUTO_COMPACT_PHASE_TIMEOUT_MS,
@@ -15,6 +13,7 @@ import {
 } from "./constants.ts";
 
 const ZERO_COUNT = 0 as const;
+const ONE_COUNT = 1 as const;
 
 export const IDLE_PHASE = "idle" as const;
 export const YIELDING_PHASE = "yielding-mid-turn" as const;
@@ -42,50 +41,7 @@ export interface ThreadAutoCompactState {
   yieldThreshold: number | null;
 }
 
-/** Domain error raised when an SDK call without native AbortSignal exceeds its bound. */
-export class AutoCompactRequestTimeoutError extends Error {
-  constructor(operation: string, timeoutMs: number) {
-    super(`${operation} exceeded ${timeoutMs}ms timeout`);
-    this.name = "AutoCompactRequestTimeoutError";
-  }
-}
-
-/** Bounds RPCs whose SDK signature lacks a native AbortSignal so locks always release. */
-export async function awaitWithTimeout<T>(
-  promise: Promise<T>,
-  lifecycleSignal: AbortSignal,
-  operation: string,
-  timeoutMs: number,
-): Promise<T> {
-  if (lifecycleSignal.aborted) {
-    throw new AutoCompactRequestTimeoutError(operation, ZERO_COUNT);
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_resolve, reject) => {
-        onAbort = () => {
-          reject(new AutoCompactRequestTimeoutError(operation, ZERO_COUNT));
-        };
-        lifecycleSignal.addEventListener("abort", onAbort, { once: true });
-        timer = setTimeout(() => {
-          reject(new AutoCompactRequestTimeoutError(operation, timeoutMs));
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    if (onAbort !== undefined) {
-      lifecycleSignal.removeEventListener("abort", onAbort);
-    }
-  }
-}
-
-/** Creates an initialized per-thread tracker entry with clean idle defaults. */
+/** Starts per-thread tracking in a clean idle state before any compaction attempt. */
 export function createInitialThreadState(now: number): ThreadAutoCompactState {
   return {
     phase: IDLE_PHASE,
@@ -101,7 +57,7 @@ export function createInitialThreadState(now: number): ThreadAutoCompactState {
   };
 }
 
-/** Resets transient yield metadata when leaving `yielding-mid-turn` or recovering errors. */
+/** Clears transient yield snapshots when returning to `idle` so stale tokens never carry over. */
 export function resetToIdlePhase(
   state: ThreadAutoCompactState,
   now: number,
@@ -112,7 +68,63 @@ export function resetToIdlePhase(
   state.yieldThreshold = null;
 }
 
-/** Recovers stuck phases if an expected lifecycle transition never arrives. */
+/** Records a steered mid-turn yield before RPC dispatch so concurrent events coalesce. */
+export function beginMidTurnYield(
+  state: ThreadAutoCompactState,
+  latestSeq: number,
+  turnSeq: number,
+  usage: ContextUsageSnapshot,
+  threshold: number,
+  now: number,
+): void {
+  state.phase = YIELDING_PHASE;
+  state.phaseUpdatedAtMs = now;
+  state.yieldSteerSeq = latestSeq;
+  state.yieldUsage = usage;
+  state.yieldThreshold = threshold;
+  state.lastAttemptedTurnSeq = turnSeq;
+}
+
+/** Restores retryability on the active turn when a mid-turn `steer` RPC fails. */
+export function rollbackMidTurnYield(
+  state: ThreadAutoCompactState,
+  now: number,
+): void {
+  resetToIdlePhase(state, now);
+  state.lastAttemptedTurnSeq = undefined;
+}
+
+/** Arms loop-prevention latches before dispatching `compactFirst` continuation. */
+export function beginCompactAndResume(
+  state: ThreadAutoCompactState,
+  latestSeq: number,
+  now: number,
+): number {
+  state.phase = COMPACTING_RESUME_PHASE;
+  state.phaseUpdatedAtMs = now;
+  state.awaitingDropOrNewTurn = true;
+  state.lastCompactionSeq = latestSeq;
+  state.consecutiveAutoCompactions += ONE_COUNT;
+  state.yieldUsage = null;
+  state.yieldThreshold = null;
+  return state.consecutiveAutoCompactions;
+}
+
+/** Arms loop-prevention latches before dispatching idle post-turn compaction. */
+export function beginIdleCompaction(
+  state: ThreadAutoCompactState,
+  latestSeq: number,
+  turnSeq: number,
+  now: number,
+): void {
+  state.phase = COMPACTING_IDLE_PHASE;
+  state.phaseUpdatedAtMs = now;
+  state.awaitingDropOrNewTurn = true;
+  state.lastCompactionSeq = latestSeq;
+  state.lastAttemptedTurnSeq = turnSeq;
+}
+
+/** Unwedges a thread if an expected yield or compaction lifecycle event never arrives. */
 export function recoverStalePhase(
   state: ThreadAutoCompactState,
   now: number,
@@ -190,11 +202,23 @@ export function syncStateWithActivity(
  * accumulate unbounded state across ephemeral threads.
  */
 export class ThreadAutoCompactStore {
+  private readonly maxTrackedThreads: number;
   private readonly states = new Map<string, ThreadAutoCompactState>();
 
-  /** Reads existing state without creating an entry on the common below-threshold path. */
-  peek(threadId: string): ThreadAutoCompactState | undefined {
-    return this.states.get(threadId);
+  constructor(maxTrackedThreads: number = AUTO_COMPACT_MAX_TRACKED_THREADS) {
+    this.maxTrackedThreads = maxTrackedThreads;
+  }
+
+  /**
+   * Inspects tracked state without allocating on the common below-threshold fast
+   * path, while still recovering phases that exceeded their timeout budget.
+   */
+  peekFresh(threadId: string, now: number): ThreadAutoCompactState | undefined {
+    const existing = this.states.get(threadId);
+    if (existing !== undefined) {
+      recoverStalePhase(existing, now);
+    }
+    return existing;
   }
 
   /** Promotes or allocates bounded LRU state while recovering timed-out phases. */
@@ -206,7 +230,7 @@ export class ThreadAutoCompactStore {
       recoverStalePhase(existing, now);
       return existing;
     }
-    if (this.states.size >= AUTO_COMPACT_MAX_TRACKED_THREADS) {
+    if (this.states.size >= this.maxTrackedThreads) {
       const oldest = this.states.keys().next().value;
       if (oldest !== undefined) {
         this.states.delete(oldest);
@@ -217,12 +241,12 @@ export class ThreadAutoCompactStore {
     return created;
   }
 
-  /** Drops state when a thread is archived or deleted. */
+  /** Prevents orphaned entries from lingering after thread archival or deletion. */
   delete(threadId: string): void {
     this.states.delete(threadId);
   }
 
-  /** Releases all tracked entries on plugin disposal. */
+  /** Releases all per-thread memory immediately when the plugin unloads. */
   clear(): void {
     this.states.clear();
   }

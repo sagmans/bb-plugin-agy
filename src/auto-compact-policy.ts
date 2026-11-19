@@ -14,8 +14,6 @@ import {
   PROVIDER_ID,
 } from "./constants.ts";
 
-export * from "./auto-compact-events.ts";
-
 const ACTIVE_STATUS = "active" as const;
 const IDLE_STATUS = "idle" as const;
 const ZERO_COUNT = 0 as const;
@@ -59,17 +57,6 @@ export interface ContextUsageSnapshot {
   readonly modelContextWindow: number;
 }
 
-/** Captures active-turn facts needed to avoid tool interruption and infinite loops. */
-export interface MidTurnDecisionInput {
-  readonly enabled: boolean;
-  readonly threshold: number;
-  readonly usedTokens: number | null;
-  readonly activity: RecentThreadActivity;
-  readonly awaitingDropOrNewTurn: boolean;
-  readonly lastAttemptedTurnSeq: number | undefined;
-  readonly consecutiveAutoCompactions: number;
-}
-
 /** Captures idle-thread facts needed for safe post-turn background compaction. */
 export interface IdleDecisionInput {
   readonly enabled: boolean;
@@ -78,6 +65,11 @@ export interface IdleDecisionInput {
   readonly activity: RecentThreadActivity;
   readonly awaitingDropOrNewTurn: boolean;
   readonly lastAttemptedTurnSeq: number | undefined;
+}
+
+/** Extends idle inputs with active-turn loop count to guard mid-turn yields. */
+export interface MidTurnDecisionInput extends IdleDecisionInput {
+  readonly consecutiveAutoCompactions: number;
 }
 
 /** Discriminates actionable compactions from diagnostic skip reasons. */
@@ -131,90 +123,85 @@ export function isEligibleActiveAutoCompactThread(
   return isLiveUnqueuedAgyThread(thread, ACTIVE_STATUS);
 }
 
-type ThresholdUsageValidation =
-  | { readonly ok: true; readonly usedTokens: number }
-  | { readonly ok: false; readonly reason: string };
-
-type TurnGuardValidation =
-  | { readonly ok: true; readonly turnSeq: number }
-  | { readonly ok: false; readonly reason: string };
-
-/** Checks shared threshold and usage preconditions before mode-specific guards. */
-function validateThresholdAndUsage(
+/** Rejects disabled configs, malformed thresholds, or below-threshold token counts early. */
+function thresholdSkipReason(
   enabled: boolean,
   threshold: number,
   usedTokens: number | null,
-): ThresholdUsageValidation {
+): string | null {
   if (!enabled) {
-    return { ok: false, reason: SKIP_DISABLED };
+    return SKIP_DISABLED;
   }
   if (!autoCompactThresholdSchema.safeParse(threshold).success) {
-    return { ok: false, reason: SKIP_INVALID_THRESHOLD };
+    return SKIP_INVALID_THRESHOLD;
   }
   if (
     usedTokens === null ||
     !Number.isFinite(usedTokens) ||
     usedTokens < ZERO_COUNT
   ) {
-    return { ok: false, reason: SKIP_MISSING_USAGE };
+    return SKIP_MISSING_USAGE;
   }
   if (usedTokens < threshold) {
-    return { ok: false, reason: SKIP_BELOW_THRESHOLD };
+    return SKIP_BELOW_THRESHOLD;
   }
-  return { ok: true, usedTokens };
+  return null;
 }
 
-/** Enforces shared turn-boundary and loop-prevention checks for both modes. */
-function validateTurnCompactionGuards(
+/** Prevents duplicate triggers when usage is stale or the turn already compacted. */
+function turnGuardSkipReason(
   activity: RecentThreadActivity,
   awaitingDropOrNewTurn: boolean,
   lastAttemptedTurnSeq: number | undefined,
-): TurnGuardValidation {
+): string | null {
   if (activity.latestTurnStartedSeq === null) {
-    return { ok: false, reason: SKIP_NO_TURN };
+    return SKIP_NO_TURN;
   }
   if (activity.latestTurnStartedSeq <= activity.latestCompactionBoundarySeq) {
-    return { ok: false, reason: SKIP_ALREADY_COMPACTED };
+    return SKIP_ALREADY_COMPACTED;
   }
   if (
     activity.latestUsageEventSeq > ZERO_COUNT &&
     activity.latestUsageEventSeq <= activity.latestCompactionBoundarySeq
   ) {
-    return { ok: false, reason: SKIP_STALE_USAGE };
+    return SKIP_STALE_USAGE;
   }
   if (awaitingDropOrNewTurn) {
-    return { ok: false, reason: SKIP_AWAITING_DROP };
+    return SKIP_AWAITING_DROP;
   }
   if (lastAttemptedTurnSeq === activity.latestTurnStartedSeq) {
-    return { ok: false, reason: SKIP_ALREADY_ATTEMPTED };
+    return SKIP_ALREADY_ATTEMPTED;
   }
-  return { ok: true, turnSeq: activity.latestTurnStartedSeq };
+  return null;
 }
 
-/** Runs threshold, usage, and turn-boundary checks shared by active and idle paths. */
-function evaluateBaseAutoCompactDecision(
+/**
+ * Decides whether an idle thread should trigger post-turn compaction without
+ * looping when compaction skips or leaves usage above the configured threshold.
+ */
+export function evaluateIdleAutoCompactDecision(
   input: IdleDecisionInput,
 ): AutoCompactDecision {
-  const usageCheck = validateThresholdAndUsage(
+  const usageSkip = thresholdSkipReason(
     input.enabled,
     input.threshold,
     input.usedTokens,
   );
-  if (!usageCheck.ok) {
-    return { action: "skip", reason: usageCheck.reason };
+  if (usageSkip !== null) {
+    return { action: "skip", reason: usageSkip };
   }
-  const guardCheck = validateTurnCompactionGuards(
+  const guardSkip = turnGuardSkipReason(
     input.activity,
     input.awaitingDropOrNewTurn,
     input.lastAttemptedTurnSeq,
   );
-  if (!guardCheck.ok) {
-    return { action: "skip", reason: guardCheck.reason };
+  if (guardSkip !== null) {
+    return { action: "skip", reason: guardSkip };
   }
   return {
     action: "compact",
-    turnSeq: guardCheck.turnSeq,
-    usedTokens: usageCheck.usedTokens,
+    turnSeq: input.activity.latestTurnStartedSeq as number,
+    usedTokens: input.usedTokens as number,
   };
 }
 
@@ -234,17 +221,7 @@ export function evaluateMidTurnAutoCompactDecision(
   if (input.consecutiveAutoCompactions >= AUTO_COMPACT_MAX_CONSECUTIVE) {
     return { action: "skip", reason: SKIP_MAX_CONSECUTIVE };
   }
-  return evaluateBaseAutoCompactDecision(input);
-}
-
-/**
- * Decides whether an idle thread should trigger post-turn compaction without
- * looping when compaction skips or leaves usage above the configured threshold.
- */
-export function evaluateIdleAutoCompactDecision(
-  input: IdleDecisionInput,
-): AutoCompactDecision {
-  return evaluateBaseAutoCompactDecision(input);
+  return evaluateIdleAutoCompactDecision(input);
 }
 
 /** Confirms a steered mid-turn yield ended normally rather than by user Stop. */

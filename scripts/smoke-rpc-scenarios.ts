@@ -1,21 +1,28 @@
 /**
  * Exercises host dialect fail-closed account probes, unsettled cache coalescing,
- * and server `UsageSource` window label mapping, refresh queuing, and host
- * removal/disconnect states without requiring a running BB daemon.
+ * completion-time TTL refresh, and server `UsageSource` window label mapping,
+ * refresh queuing, and host removal/disconnect states without a live BB daemon.
  */
 
 import type { ProviderUsageResult } from "@get-bb/plugin-sdk/provider-bridge";
-import { PROVIDER_DISPLAY_NAME, PROVIDER_ID } from "../src/constants.ts";
+import {
+  AGY_COMMAND,
+  HTTP_NOT_FOUND,
+  PROVIDER_DISPLAY_NAME,
+  PROVIDER_ID,
+} from "../src/constants.ts";
 import {
   AgyAccountProbeError,
+  type AgyAccountProbeStatus,
   createAntigravityDialect,
 } from "../src/dialect.ts";
 import {
   type BridgeUsage,
+  DISCONNECTED_HOST_MESSAGE,
+  REMOVED_RESOURCE_MESSAGE,
   resourceId,
-  UsageSource,
-  type UsageSourceBackend,
-} from "../src/usage-source.ts";
+} from "../src/usage-rpc-contract.ts";
+import { UsageSource, type UsageSourceBackend } from "../src/usage-source.ts";
 
 export type ExpectFn = (name: string, passed: boolean, detail: unknown) => void;
 
@@ -23,17 +30,54 @@ const HOST_ID = "host_local" as const;
 const HOST_NAME = "Local Mac" as const;
 const CONNECTED_STATUS = "connected" as const;
 const DISCONNECTED_STATUS = "disconnected" as const;
-const HTTP_NOT_FOUND = 404 as const;
+const NOT_FOUND_ERROR_TEXT = "Host not found" as const;
+const TRANSIENT_PROBE_ERROR_TEXT = "probe failed" as const;
 const TEST_CACHE_TTL_MS = 10_000 as const;
 const PAST_TTL_CLOCK_MS = 15_000 as const;
+const WITHIN_TTL_CLOCK_MS = 5_000 as const;
 const INITIAL_CLOCK_MS = 1_000 as const;
 const UNGATE_DELAY_MS = 10 as const;
+
+const BRIDGE_WINDOWS_FIXTURE = [
+  { label: "Weekly · Gemini", usedPercent: 1, resetsAt: null },
+  { label: "5 hours · Gemini", usedPercent: 5, resetsAt: null },
+  { label: "Weekly · Claude/GPT", usedPercent: 10, resetsAt: null },
+  { label: "5 hours · Claude/GPT", usedPercent: 25, resetsAt: null },
+] as const;
+
+const EXPECTED_MAPPED_WINDOWS = [
+  {
+    kind: "weekly",
+    label: "Weekly · Gemini",
+    model: "Gemini",
+    usedPercent: 1,
+  },
+  { kind: "custom", label: "5h · Gemini", model: null, usedPercent: 5 },
+  {
+    kind: "weekly",
+    label: "Weekly · Claude/GPT",
+    model: "Claude/GPT",
+    usedPercent: 10,
+  },
+  { kind: "custom", label: "5h · Claude/GPT", model: null, usedPercent: 25 },
+] as const;
+
+/** Models BB's HTTP-status-tagged host lookup failure without `Object.assign` mutation. */
+class HttpStatusError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "HttpStatusError";
+    this.status = status;
+  }
+}
 
 /** Verifies `readAccount` returns `{ email: null }` only on `"ok"` and throws on non-ready states. */
 async function runDialectAccountScenarios(expect: ExpectFn): Promise<void> {
   const makeDialect = (result: ProviderUsageResult) =>
     createAntigravityDialect({
-      resolveCommand: async () => "agy",
+      resolveCommand: async () => AGY_COMMAND,
       readUsage: async () => result,
     });
 
@@ -62,7 +106,7 @@ async function runDialectAccountScenarios(expect: ExpectFn): Promise<void> {
       supported: true,
       usage: {
         status: "error",
-        message: "probe failed",
+        message: TRANSIENT_PROBE_ERROR_TEXT,
         accountEmail: null,
         planLabel: null,
       },
@@ -72,7 +116,7 @@ async function runDialectAccountScenarios(expect: ExpectFn): Promise<void> {
     { supported: false },
   ];
 
-  const caughtStatuses: string[] = [];
+  const caughtStatuses: AgyAccountProbeStatus[] = [];
   for (const result of nonReadyResults) {
     try {
       await makeDialect(result).maintenance?.readAccount();
@@ -89,7 +133,10 @@ async function runDialectAccountScenarios(expect: ExpectFn): Promise<void> {
   );
 }
 
-/** Verifies `cachedUsage` reuses unsettled probes past TTL and evicts failed probes safely. */
+/**
+ * Verifies `cachedUsage` reuses unsettled probes past TTL, evicts failed probes,
+ * and measures the 10 s cache window from probe completion rather than launch.
+ */
 async function runDialectCacheScenarios(expect: ExpectFn): Promise<void> {
   let clock: number = INITIAL_CLOCK_MS;
   let spawnCount = 0;
@@ -98,10 +145,10 @@ async function runDialectCacheScenarios(expect: ExpectFn): Promise<void> {
   const dialect = createAntigravityDialect({
     now: () => clock,
     cacheTtlMs: TEST_CACHE_TTL_MS,
-    resolveCommand: async () => "agy",
+    resolveCommand: async () => AGY_COMMAND,
     readUsage: () => {
       spawnCount += 1;
-      if (spawnCount === 1) {
+      if (spawnCount <= 2) {
         return new Promise((resolve) => {
           resolveSlowProbe = resolve;
         });
@@ -127,14 +174,24 @@ async function runDialectCacheScenarios(expect: ExpectFn): Promise<void> {
     supported: true,
     usage: {
       status: "error",
-      message: "transient error",
+      message: TRANSIENT_PROBE_ERROR_TEXT,
       accountEmail: null,
       planLabel: null,
     },
   });
   await Promise.all([firstCall, secondCallWhileUnsettled]);
+
+  const slowOkCall = dialect.maintenance?.readUsage();
+  await Promise.resolve();
+  clock += PAST_TTL_CLOCK_MS;
+  resolveSlowProbe?.({
+    supported: true,
+    usage: { status: "ok", accountEmail: null, planLabel: null, windows: [] },
+  });
+  await slowOkCall;
+  clock += WITHIN_TTL_CLOCK_MS;
   await dialect.maintenance?.readUsage();
-  await dialect.maintenance?.readUsage();
+
   expect(
     "dialect-cache-dedup-and-eviction",
     dedupedPastTtl && spawnCount === 2,
@@ -157,7 +214,7 @@ function createMockUsageBackend(options: {
     ],
     getHost: async () => {
       if (options.isHostMissing?.()) {
-        throw Object.assign(new Error("Not found"), { status: HTTP_NOT_FOUND });
+        throw new HttpStatusError(NOT_FOUND_ERROR_TEXT, HTTP_NOT_FOUND);
       }
       return { id: HOST_ID, name: HOST_NAME, status: statusOf() };
     },
@@ -190,12 +247,7 @@ async function runUsageSourceMappingScenario(expect: ExpectFn): Promise<void> {
           status: "ok",
           accountEmail: null,
           planLabel: null,
-          windows: [
-            { label: "Weekly · Gemini", usedPercent: 1, resetsAt: null },
-            { label: "5 hours · Gemini", usedPercent: 5, resetsAt: null },
-            { label: "Weekly · Claude/GPT", usedPercent: 10, resetsAt: null },
-            { label: "5 hours · Claude/GPT", usedPercent: 25, resetsAt: null },
-          ],
+          windows: [...BRIDGE_WINDOWS_FIXTURE],
         };
       },
     }),
@@ -220,28 +272,7 @@ async function runUsageSourceMappingScenario(expect: ExpectFn): Promise<void> {
     listed.resources.length === 1 &&
       calls === 1 &&
       cachedPassive.observedAt === collected.observedAt &&
-      JSON.stringify(mapped) ===
-        JSON.stringify([
-          {
-            kind: "weekly",
-            label: "Weekly · Gemini",
-            model: "Gemini",
-            usedPercent: 1,
-          },
-          { kind: "custom", label: "5h · Gemini", model: null, usedPercent: 5 },
-          {
-            kind: "weekly",
-            label: "Weekly · Claude/GPT",
-            model: "Claude/GPT",
-            usedPercent: 10,
-          },
-          {
-            kind: "custom",
-            label: "5h · Claude/GPT",
-            model: null,
-            usedPercent: 25,
-          },
-        ]),
+      JSON.stringify(mapped) === JSON.stringify(EXPECTED_MAPPED_WINDOWS),
     mapped,
   );
 
@@ -257,8 +288,8 @@ async function runUsageSourceMappingScenario(expect: ExpectFn): Promise<void> {
   expect(
     "usage-source-disconnected-and-removed",
     disconnected.usage.status === "error" &&
-      disconnected.usage.message === "Machine is disconnected." &&
-      removedError === "Usage resource no longer exists.",
+      disconnected.usage.message === DISCONNECTED_HOST_MESSAGE &&
+      removedError === REMOVED_RESOURCE_MESSAGE,
     { disconnected: disconnected.usage, removedError },
   );
 }
