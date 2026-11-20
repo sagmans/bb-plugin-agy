@@ -42,12 +42,24 @@ run_step 'format and lint' "$local_timeout" npm run lint
 run_step 'typecheck' "$local_timeout" npm run typecheck
 run_step 'duplication' "$local_timeout" npm run duplicates
 run_step 'complexity' "$local_timeout" lizard -C "$max_ccn" -L "$max_fn_length" -w src scripts server.ts host.ts app.tsx
-run_step 'static analysis' "$local_timeout" env SEMGREP_SEND_METRICS=off SEMGREP_ENABLE_VERSION_CHECK=0 semgrep scan --config .githooks/lib/semgrep --metrics=off --disable-version-check --severity ERROR --error --quiet --emacs src scripts server.ts host.ts app.tsx .githooks/pre-commit.d .githooks/pre-push.d
+# Only tracked hook checks are scanned by semgrep; untracked local hooks in
+# .githooks/<hook>.d/ stay out of repository checks.
+hook_list=$(mktemp "${TMPDIR:-/tmp}/agy-hooks.XXXXXX")
+trap '[[ -n "${hook_list:-}" && "${hook_list##*/}" == agy-hooks.* ]] && rm -f -- "$hook_list"' EXIT
+git ls-files -z -- '.githooks/*.d/*' >"$hook_list"
+hooks=()
+while IFS= read -r -d '' file; do
+	[[ -n "$file" ]] && hooks+=("$file")
+done <"$hook_list"
+[[ ${#hooks[@]} -gt 0 ]] || {
+	printf 'No tracked hook checks found.\n' >&2
+	exit 1
+}
+run_step 'static analysis' "$local_timeout" env SEMGREP_SEND_METRICS=off SEMGREP_ENABLE_VERSION_CHECK=0 semgrep scan --config .githooks/lib/semgrep --metrics=off --disable-version-check --severity ERROR --error --quiet --emacs src scripts server.ts host.ts app.tsx "${hooks[@]}"
 run_step 'dependency audit (npm)' "$network_timeout" npm audit
 run_step 'dependency audit (osv)' "$network_timeout" osv-scanner scan source --no-call-analysis=all -L package-lock.json
 run_step 'build' "$local_timeout" npm run build
-run_step 'shell analysis' "$local_timeout" shellcheck -x scripts/setup-hooks scripts/check .githooks/pre-commit.d/* .githooks/pre-push.d/*
-run_step 'shell format' "$local_timeout" shfmt -d scripts/check .githooks/pre-commit.d .githooks/pre-push.d
+run_step 'shell lint and format' "$local_timeout" bash scripts/lint-sh
 run_step 'markdown' "$local_timeout" markdownlint-cli2 README.md PLUGIN_OVERVIEW.md AGENTS.md SECURITY.md skills/agy-provider/SKILL.md
 # Exercises offline fixtures, real subprocess failure budgets, RPC/dialect contracts, and live quota.
 run_step 'usage smoke' "$local_timeout" npm run smoke

@@ -70,7 +70,10 @@ of each file.
 
 - `.githooks/` holds generic hooks copied from a shared template. Never edit
   `.githooks/{pre-commit,pre-push,commit-msg,...}` or `.githooks/lib/` here.
-  Repository checks go in `.githooks/<hook>.d/NN-name` and in `scripts/check`.
+  Repository checks go in `.githooks/<hook>.d/NN-name`, `scripts/check`, and
+  `scripts/lint-sh`.
+- `pre-commit` checks the staged index snapshot with Biome (`10-project`) and
+  with `shellcheck` + `shfmt` when shell scripts change (`20-shell-lint`).
 - `scripts/check` runs `gitleaks`, Biome, `tsc`, `jscpd`, `lizard`, `semgrep`,
   `npm audit`, `osv-scanner`, `bb plugin build`, `shellcheck`, `shfmt`,
   `markdownlint-cli2`, and `npm run smoke`.

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Shared shell lint and format gate for `scripts/check` (push) and staged
+# `pre-commit`, keeping the file set, exclusions, and flags identical.
+# Only tracked hook checks are judged in a git checkout so untracked local
+# checks in .githooks/<hook>.d/ keep their own format.
+# setup-hooks is a shared template file, so it is linted but keeps its format.
+set -euo pipefail
+
+for tool in shellcheck shfmt; do
+	command -v "$tool" >/dev/null || {
+		printf 'Missing %s; install it before checking shell scripts.\n' "$tool" >&2
+		exit 1
+	}
+done
+
+hooks=()
+if [[ -e .git ]]; then
+	list=$(mktemp "${TMPDIR:-/tmp}/agy-lint-sh.XXXXXX")
+	trap '[[ -n "${list:-}" && "${list##*/}" == agy-lint-sh.* ]] && rm -f -- "$list"' EXIT
+	git ls-files -z -- '.githooks/*.d/*' >"$list"
+	while IFS= read -r -d '' file; do
+		[[ -n "$file" ]] && hooks+=("$file")
+	done <"$list"
+else
+	shopt -s nullglob
+	hooks=(.githooks/*.d/*)
+fi
+[[ ${#hooks[@]} -gt 0 ]] || {
+	printf 'No tracked hook checks found.\n' >&2
+	exit 1
+}
+
+shellcheck -x -- scripts/setup-hooks scripts/check scripts/lint-sh "${hooks[@]}"
+shfmt -d -- scripts/check scripts/lint-sh "${hooks[@]}"

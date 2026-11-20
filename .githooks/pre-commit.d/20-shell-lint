@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Check indexed shell scripts so partial staging cannot hide a shell lint or
+# format failure. Delegates to scripts/lint-sh so commit and push share one gate.
+set -euo pipefail
+# shellcheck source=.githooks/lib/helpers.sh
+. "${HOOK_HELPERS:?run through the repository pre-commit hook}"
+
+readonly check_timeout=60
+readonly scratch_prefix=agy-shell
+readonly shell_pathspecs=('.githooks/*.d/*' 'scripts/setup-hooks' 'scripts/check' 'scripts/lint-sh')
+
+staged=$(staged_git diff --cached --name-only --diff-filter=ACMR -- "${shell_pathspecs[@]}") || exit 1
+[[ -n "$staged" ]] || exit 0
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/$scratch_prefix.XXXXXX")
+cleanup() {
+	# Only this run's indexed copy is temporary; guard the name before removal.
+	if [[ -d "$scratch" && "${scratch##*/}" == "$scratch_prefix".* ]]; then
+		rm -r -- "$scratch"
+	fi
+}
+trap cleanup EXIT
+
+# Reject symlinks before extraction so staged content cannot point outside the copy.
+staged_git ls-files --stage >"$scratch/index-modes"
+if grep -q '^120000 ' "$scratch/index-modes"; then
+	printf 'Staged verification refuses symlinks.\n' >&2
+	exit 1
+fi
+
+staged_git checkout-index --all --prefix="$scratch/tree/"
+cd "$scratch/tree"
+run_step 'staged shell lint and format' "$check_timeout" bash scripts/lint-sh
