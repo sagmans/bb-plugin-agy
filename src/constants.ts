@@ -248,8 +248,12 @@ export const AUTO_COMPACT_USAGE_EVENTS_LIMIT = "1" as const;
  */
 export const AUTO_COMPACT_MAX_CONSECUTIVE = 10 as const;
 
-/** Recovers thread state if a steered mid-turn yield never settles to idle. */
-export const AUTO_COMPACT_YIELD_TIMEOUT_MS = 60_000 as const;
+/**
+ * Allows slow high-effort reasoning steps (which can exceed 60s) to finish
+ * yielding cleanly before expiring in-memory state; persisted-event recovery
+ * still catches even slower turns, plugin reloads, and server restarts.
+ */
+export const AUTO_COMPACT_YIELD_TIMEOUT_MS = 300_000 as const;
 
 /**
  * Marks plugin-authored agent-only yield and continuation turns so history

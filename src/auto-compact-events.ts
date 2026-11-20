@@ -18,6 +18,7 @@ const SINGLE_BLOCK_COUNT = 1 as const;
 const EMPTY_TURN_STATUS = "" as const;
 const COMMAND_RESOURCE_KIND = "command" as const;
 const USER_INITIATOR = "user" as const;
+const STEER_TARGET_KIND = "steer" as const;
 const COMPACT_COMMAND_NAME = "compact" as const;
 const COMPACT_COMMAND_TEXT = "/compact" as const;
 const COMPACTION_SKIPPED_WARNING = "compaction-skipped" as const;
@@ -37,16 +38,24 @@ const THREAD_CONTEXT_CLEARED_EVENT = "thread/context/cleared" as const;
 const CONTEXT_USAGE_UPDATED_EVENT =
   "thread/contextWindowUsage/updated" as const;
 const CLIENT_TURN_REQUESTED_EVENT = "client/turn/requested" as const;
+const CLIENT_TURN_REJECTED_EVENT = "client/turn/rejected" as const;
 const THREAD_INTERRUPTED_EVENT = "system/thread/interrupted" as const;
 const PROVIDER_WARNING_EVENT = "provider/warning" as const;
 
 const REQUEST_KIND_COMPACT = "compact" as const;
+const REQUEST_KIND_YIELD_STEER = "yield-steer" as const;
 const REQUEST_KIND_USER = "user" as const;
 
 type ClientRequestKind =
   | typeof REQUEST_KIND_COMPACT
+  | typeof REQUEST_KIND_YIELD_STEER
   | typeof REQUEST_KIND_USER
   | null;
+
+interface ClassifiedClientRequest {
+  readonly kind: ClientRequestKind;
+  readonly requestId: string | undefined;
+}
 
 /**
  * Item types that represent model output, user text, or compaction rather than
@@ -69,6 +78,7 @@ export const AUTO_COMPACT_BOUNDARY_EVENT_TYPES = [
   THREAD_COMPACTED_EVENT,
   THREAD_CONTEXT_CLEARED_EVENT,
   CLIENT_TURN_REQUESTED_EVENT,
+  CLIENT_TURN_REJECTED_EVENT,
   THREAD_INTERRUPTED_EVENT,
   PROVIDER_WARNING_EVENT,
 ] as const;
@@ -122,11 +132,21 @@ const clientRequestBlockSchema = z.object({
 });
 
 const clientTurnRequestedDataSchema = z.object({
+  requestId: z.string().optional(),
   // Accept any string so future SDK initiators never break `/compact` parsing
   // while still failing closed on any non-`"user"` initiator.
   initiator: z.string().optional(),
+  target: z
+    .object({
+      kind: z.string(),
+    })
+    .optional(),
   input: z.array(clientRequestBlockSchema).optional(),
   originPluginId: z.string().nullable().optional(),
+});
+
+const clientTurnRejectedDataSchema = z.object({
+  requestId: z.string(),
 });
 
 /** Decouples pure event-window inspection from full SDK database row types. */
@@ -147,6 +167,9 @@ export interface RecentThreadActivity {
   readonly latestCompactionBoundarySeq: number;
   readonly latestUsageEventSeq: number;
   readonly latestUserRequestSeq: number;
+  readonly latestYieldSteerSeq: number;
+  /** Malformed rejections also cancel recovery when their target cannot be established. */
+  readonly latestRejectedYieldSteerSeq: number;
   readonly latestInterruptedSeq: number;
   readonly isCompactionTurn: boolean;
   readonly hasOpenToolExecution: boolean;
@@ -189,14 +212,10 @@ function isCompactClientRequest(
   );
 }
 
-/** Identifies plugin-authored yield and resume prompts so they do not look like new user tasks. */
-function isPluginAutoCompactRequest(
-  originPluginId: string | null | undefined,
+/** Matches plugin-authored agent-only control blocks without coupling to full prose. */
+function hasAgentOnlyTextPrefix(
   blocks: readonly z.infer<typeof clientRequestBlockSchema>[],
 ): boolean {
-  if (originPluginId === PROVIDER_ID) {
-    return true;
-  }
   return blocks.some(
     (block) =>
       block.type === AUTO_COMPACT_TEXT_BLOCK_TYPE &&
@@ -206,28 +225,36 @@ function isPluginAutoCompactRequest(
 }
 
 /**
- * Isolates real user prompts and `/compact` requests from plugin continuations
- * and non-user messages so only human prompts reset loop-breaker counters.
+ * Isolates real user prompts, `/compact` requests, and protocol-level plugin
+ * yield steers (`originPluginId` + `target.kind === "steer"` + agent-only prefix)
+ * from continuations so only human prompts reset loop counters and non-steer
+ * turns never trigger yield recovery.
  */
-function classifyClientRequest(data: unknown): ClientRequestKind {
+function classifyClientRequest(data: unknown): ClassifiedClientRequest {
   const parsed = clientTurnRequestedDataSchema.safeParse(data);
   if (!parsed.success) {
-    return null;
+    return { kind: null, requestId: undefined };
   }
+  const { requestId, originPluginId, target, initiator } = parsed.data;
   const blocks = parsed.data.input ?? [];
   if (isCompactClientRequest(blocks)) {
-    return REQUEST_KIND_COMPACT;
+    return { kind: REQUEST_KIND_COMPACT, requestId };
   }
-  if (isPluginAutoCompactRequest(parsed.data.originPluginId, blocks)) {
-    return null;
+  if (originPluginId === PROVIDER_ID) {
+    const isYieldSteer =
+      target?.kind === STEER_TARGET_KIND && hasAgentOnlyTextPrefix(blocks);
+    return {
+      kind: isYieldSteer ? REQUEST_KIND_YIELD_STEER : null,
+      requestId,
+    };
   }
-  if (
-    parsed.data.initiator !== undefined &&
-    parsed.data.initiator !== USER_INITIATOR
-  ) {
-    return null;
+  if (hasAgentOnlyTextPrefix(blocks)) {
+    return { kind: null, requestId };
   }
-  return REQUEST_KIND_USER;
+  if (initiator !== undefined && initiator !== USER_INITIATOR) {
+    return { kind: null, requestId };
+  }
+  return { kind: REQUEST_KIND_USER, requestId };
 }
 
 /**
@@ -236,26 +263,25 @@ function classifyClientRequest(data: unknown): ClientRequestKind {
  */
 function inspectTurnItemEvent(
   event: RecentThreadEvent,
-  completedItemIds: Set<string>,
-  state: { isCompactionTurn: boolean; hasOpenToolExecution: boolean },
+  acc: ActivityAccumulator,
 ): void {
   const parsed = itemEventDataSchema.safeParse(event.data);
   if (!parsed.success) {
     if (event.type === ITEM_STARTED_EVENT) {
-      state.hasOpenToolExecution = true;
+      acc.hasOpenToolExecution = true;
     }
     return;
   }
   const { id, type } = parsed.data.item;
   if (type === COMPACTION_ITEM_TYPE) {
-    state.isCompactionTurn = true;
+    acc.isCompactionTurn = true;
   }
   if (event.type === ITEM_COMPLETED_EVENT) {
-    completedItemIds.add(id);
+    acc.completedItemIds.add(id);
     return;
   }
-  if (!completedItemIds.has(id) && !NON_TOOL_ITEM_TYPES.has(type)) {
-    state.hasOpenToolExecution = true;
+  if (!acc.completedItemIds.has(id) && !NON_TOOL_ITEM_TYPES.has(type)) {
+    acc.hasOpenToolExecution = true;
   }
 }
 
@@ -283,14 +309,15 @@ interface ActivityAccumulator {
   latestCompactionBoundarySeq: number;
   latestUsageEventSeq: number;
   latestUserRequestSeq: number;
+  latestYieldSteerSeq: number;
+  latestRejectedYieldSteerSeq: number;
   latestInterruptedSeq: number;
   latestCompactRequestSeq: number;
   insideCurrentTurn: boolean;
+  isCompactionTurn: boolean;
+  hasOpenToolExecution: boolean;
   readonly completedItemIds: Set<string>;
-  readonly turnItems: {
-    isCompactionTurn: boolean;
-    hasOpenToolExecution: boolean;
-  };
+  readonly rejectedRequestIds: Set<string>;
 }
 
 /** Closes the active-turn item window once a prior `turn/completed` boundary is reached. */
@@ -308,12 +335,16 @@ function recordTurnCompleted(
   acc.insideCurrentTurn = false;
 }
 
-/** Separates user prompts from manual `/compact` requests for boundary tracking. */
+/**
+ * Separates user prompts, manual `/compact` requests, and unrejected plugin
+ * yield steers so only human prompts reset loop counters and rejected steers
+ * never falsely trigger post-yield resumption.
+ */
 function recordClientRequest(
   event: RecentThreadEvent,
   acc: ActivityAccumulator,
 ): void {
-  const kind = classifyClientRequest(event.data);
+  const { kind, requestId } = classifyClientRequest(event.data);
   if (kind === REQUEST_KIND_USER) {
     acc.latestUserRequestSeq = Math.max(acc.latestUserRequestSeq, event.seq);
   } else if (kind === REQUEST_KIND_COMPACT) {
@@ -321,10 +352,42 @@ function recordClientRequest(
       acc.latestCompactRequestSeq,
       event.seq,
     );
+  } else if (kind === REQUEST_KIND_YIELD_STEER) {
+    if (requestId !== undefined && acc.rejectedRequestIds.has(requestId)) {
+      acc.latestRejectedYieldSteerSeq = Math.max(
+        acc.latestRejectedYieldSteerSeq,
+        event.seq,
+      );
+      return;
+    }
+    acc.latestYieldSteerSeq = Math.max(acc.latestYieldSteerSeq, event.seq);
   }
 }
 
-/** Updates turn, tool, usage, and compaction watermarks from one descending event row. */
+/**
+ * Records rejected turn request ids in descending order so a rejected mid-turn
+ * yield steer is excluded before its older `client/turn/requested` row is read;
+ * malformed rejections fail closed against pending yields.
+ */
+function recordClientRejected(
+  event: RecentThreadEvent,
+  acc: ActivityAccumulator,
+): void {
+  const parsed = clientTurnRejectedDataSchema.safeParse(event.data);
+  if (parsed.success) {
+    acc.rejectedRequestIds.add(parsed.data.requestId);
+    return;
+  }
+  acc.latestRejectedYieldSteerSeq = Math.max(
+    acc.latestRejectedYieldSteerSeq,
+    event.seq,
+  );
+}
+
+/**
+ * Stops active-turn tool inspection once descending traversal crosses a turn
+ * boundary while keeping boundary, usage, and request watermarks current.
+ */
 function recordRecentEvent(
   event: RecentThreadEvent,
   acc: ActivityAccumulator,
@@ -346,7 +409,7 @@ function recordRecentEvent(
     case ITEM_STARTED_EVENT:
     case ITEM_COMPLETED_EVENT:
       if (acc.insideCurrentTurn) {
-        inspectTurnItemEvent(event, acc.completedItemIds, acc.turnItems);
+        inspectTurnItemEvent(event, acc);
       }
       return;
     case CONTEXT_USAGE_UPDATED_EVENT:
@@ -357,6 +420,9 @@ function recordRecentEvent(
       return;
     case CLIENT_TURN_REQUESTED_EVENT:
       recordClientRequest(event, acc);
+      return;
+    case CLIENT_TURN_REJECTED_EVENT:
+      recordClientRejected(event, acc);
       return;
     default:
       return;
@@ -376,11 +442,15 @@ export function analyzeRecentThreadEvents(
     latestCompactionBoundarySeq: ZERO_COUNT,
     latestUsageEventSeq: ZERO_COUNT,
     latestUserRequestSeq: ZERO_COUNT,
+    latestYieldSteerSeq: ZERO_COUNT,
+    latestRejectedYieldSteerSeq: ZERO_COUNT,
     latestInterruptedSeq: ZERO_COUNT,
     latestCompactRequestSeq: ZERO_COUNT,
     insideCurrentTurn: true,
+    isCompactionTurn: false,
+    hasOpenToolExecution: false,
     completedItemIds: new Set<string>(),
-    turnItems: { isCompactionTurn: false, hasOpenToolExecution: false },
+    rejectedRequestIds: new Set<string>(),
   };
   for (const event of events) {
     recordRecentEvent(event, acc);
@@ -401,8 +471,10 @@ export function analyzeRecentThreadEvents(
     latestCompactionBoundarySeq: acc.latestCompactionBoundarySeq,
     latestUsageEventSeq: acc.latestUsageEventSeq,
     latestUserRequestSeq: acc.latestUserRequestSeq,
+    latestYieldSteerSeq: acc.latestYieldSteerSeq,
+    latestRejectedYieldSteerSeq: acc.latestRejectedYieldSteerSeq,
     latestInterruptedSeq: acc.latestInterruptedSeq,
-    isCompactionTurn: acc.turnItems.isCompactionTurn || pendingCompactRequest,
-    hasOpenToolExecution: acc.turnItems.hasOpenToolExecution,
+    isCompactionTurn: acc.isCompactionTurn || pendingCompactRequest,
+    hasOpenToolExecution: acc.hasOpenToolExecution,
   };
 }

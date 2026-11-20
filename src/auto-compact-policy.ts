@@ -25,6 +25,44 @@ export const AUTO_COMPACT_MODE_MID_TURN = "mid-turn" as const;
 export const AUTO_COMPACT_MODE_IDLE = "idle" as const;
 export const DECISION_COMPACT = "compact" as const;
 
+export const YIELD_RESUME_REASON_DISABLED = "disabled-mid-yield" as const;
+const YIELD_RESUME_REASON_NO_USAGE = "usage-unavailable" as const;
+export const YIELD_RESUME_REASON_BELOW_THRESHOLD = "below-threshold" as const;
+export const YIELD_RESUME_REASON_MAX_CONSECUTIVE = "max-consecutive" as const;
+
+/** Typed reasons explaining why a yielded turn resumes without compacting. */
+export type YieldResumeReason =
+  | typeof YIELD_RESUME_REASON_NO_USAGE
+  | typeof YIELD_RESUME_REASON_DISABLED
+  | typeof YIELD_RESUME_REASON_BELOW_THRESHOLD
+  | typeof YIELD_RESUME_REASON_MAX_CONSECUTIVE;
+
+export const POST_YIELD_ACTION_CANCEL = "cancel" as const;
+export const POST_YIELD_ACTION_COMPACT_CONTINUE =
+  "compact-and-continue" as const;
+export const POST_YIELD_ACTION_RESUME_WITHOUT_COMPACT =
+  "resume-without-compact" as const;
+
+/**
+ * Discriminates post-yield outcomes so in-memory and persisted yield recovery
+ * enforce identical resume, compaction, and loop-breaker invariants.
+ */
+export type PostYieldDecision =
+  | {
+      readonly action: typeof POST_YIELD_ACTION_CANCEL;
+      readonly rearmDrop: boolean;
+    }
+  | {
+      readonly action: typeof POST_YIELD_ACTION_COMPACT_CONTINUE;
+      readonly threshold: number;
+      readonly usage: ContextUsageSnapshot;
+    }
+  | {
+      readonly action: typeof POST_YIELD_ACTION_RESUME_WITHOUT_COMPACT;
+      readonly reason: YieldResumeReason;
+      readonly rearmDrop: boolean;
+    };
+
 const SKIP_DISABLED = "disabled" as const;
 const SKIP_INVALID_THRESHOLD = "invalid-threshold" as const;
 const SKIP_MISSING_USAGE = "missing-usage" as const;
@@ -202,6 +240,22 @@ function evaluateBoundarySkipReason(
 ): AutoCompactSkipReason | null {
   const { activity } = input;
   if (
+    input.mode === AUTO_COMPACT_MODE_IDLE &&
+    (activity.latestTurnCompleted?.status !== COMPLETED_TURN_STATUS ||
+      activity.latestTurnCompleted.seq <= turnSeq ||
+      activity.latestInterruptedSeq >= turnSeq ||
+      activity.latestUserRequestSeq > turnSeq)
+  )
+    return SKIP_NO_TURN;
+  if (
+    input.mode === AUTO_COMPACT_MODE_MID_TURN &&
+    Math.max(
+      activity.latestYieldSteerSeq,
+      activity.latestRejectedYieldSteerSeq,
+    ) > turnSeq
+  )
+    return SKIP_ALREADY_ATTEMPTED;
+  if (
     input.mode === AUTO_COMPACT_MODE_MID_TURN &&
     isStaleMidTurnBoundary(activity, turnSeq)
   ) {
@@ -249,9 +303,10 @@ export function evaluateAutoCompactDecision(
 }
 
 /**
- * Confirms the steered turn itself finished cleanly after the yield steer,
- * rejecting user stops, newer prompts, newer started turns, and mid-yield
- * compactions so post-yield `compactFirst` never double-compacts or hijacks.
+ * Confirms the steered turn itself finished cleanly after an unrejected yield
+ * steer, rejecting user stops, newer prompts, newer started turns, rejected
+ * steers, and mid-yield compactions so post-yield settlement never hijacks
+ * naturally completed turns or double-compacts.
  */
 export function canResumeAfterMidTurnYield(
   activity: RecentThreadActivity,
@@ -261,7 +316,8 @@ export function canResumeAfterMidTurnYield(
     activity.isCompactionTurn ||
     activity.latestCompactionBoundarySeq > yieldSteerSeq ||
     activity.latestInterruptedSeq > yieldSteerSeq ||
-    activity.latestUserRequestSeq > yieldSteerSeq
+    activity.latestUserRequestSeq > yieldSteerSeq ||
+    activity.latestRejectedYieldSteerSeq > yieldSteerSeq
   ) {
     return false;
   }
@@ -280,6 +336,79 @@ export function canResumeAfterMidTurnYield(
 }
 
 /**
+ * Detects from persisted events that the completed idle turn ended because of
+ * this plugin's unrejected mid-turn yield steer, enabling compaction and
+ * continuation even after slow turns, plugin reloads, or BB server restarts.
+ */
+export function hasPersistedMidTurnYield(
+  activity: RecentThreadActivity,
+): boolean {
+  const turnSeq = activity.latestTurnStartedSeq;
+  return (
+    turnSeq !== null &&
+    activity.latestYieldSteerSeq > turnSeq &&
+    canResumeAfterMidTurnYield(activity, activity.latestYieldSteerSeq)
+  );
+}
+
+/** Inputs required to settle a yielded turn uniformly across RAM and persisted paths. */
+export interface PostYieldDecisionInput {
+  readonly activity: RecentThreadActivity;
+  readonly yieldSteerSeq: number;
+  readonly threshold: number | null;
+  readonly usage: ContextUsageSnapshot | null;
+  readonly consecutiveAutoCompactions: number;
+}
+
+/**
+ * Resolves whether a yielded turn should cancel, compact-and-continue, or
+ * resume directly without compacting so a plugin-initiated pause never strands
+ * active work while enforcing the consecutive compaction safety cap.
+ */
+export function evaluatePostYieldDecision(
+  input: PostYieldDecisionInput,
+): PostYieldDecision {
+  const { usage, threshold } = input;
+  const rearmDrop =
+    threshold !== null && usage !== null && usage.usedTokens < threshold;
+  if (!canResumeAfterMidTurnYield(input.activity, input.yieldSteerSeq)) {
+    return { action: POST_YIELD_ACTION_CANCEL, rearmDrop };
+  }
+  if (input.threshold === null) {
+    return {
+      action: POST_YIELD_ACTION_RESUME_WITHOUT_COMPACT,
+      reason: YIELD_RESUME_REASON_DISABLED,
+      rearmDrop,
+    };
+  }
+  if (
+    input.usage === null ||
+    !Number.isFinite(input.usage.usedTokens) ||
+    rearmDrop
+  ) {
+    return {
+      action: POST_YIELD_ACTION_RESUME_WITHOUT_COMPACT,
+      reason: rearmDrop
+        ? YIELD_RESUME_REASON_BELOW_THRESHOLD
+        : YIELD_RESUME_REASON_NO_USAGE,
+      rearmDrop,
+    };
+  }
+  if (input.consecutiveAutoCompactions >= AUTO_COMPACT_MAX_CONSECUTIVE) {
+    return {
+      action: POST_YIELD_ACTION_RESUME_WITHOUT_COMPACT,
+      reason: YIELD_RESUME_REASON_MAX_CONSECUTIVE,
+      rearmDrop,
+    };
+  }
+  return {
+    action: POST_YIELD_ACTION_COMPACT_CONTINUE,
+    threshold: input.threshold,
+    usage: input.usage,
+  };
+}
+
+/**
  * Instructs an active `agy` turn via an agent-only steer to end cleanly at the
  * current step boundary so compaction can run and immediately resume work.
  */
@@ -288,7 +417,8 @@ export function buildMidTurnYieldPrompt(
   threshold: number,
 ): string {
   return (
-    `${AUTO_COMPACT_MESSAGE_PREFIX}Context usage reached ${usedTokens.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)} tokens ` +
+    `${AUTO_COMPACT_MESSAGE_PREFIX}Context usage reached ` +
+    `${usedTokens.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)} tokens ` +
     `(configured auto-compact cap: ${threshold.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)}). ` +
     "Pause right now so context can compact and automatically resume your session: " +
     "do not invoke any tools, briefly note your current step in one sentence, and end this turn immediately."
@@ -308,5 +438,32 @@ export function buildPostCompactionResumePrompt(
     `${usedTokens.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)} tokens (configured cap: ${threshold.toLocaleString(AUTO_COMPACT_TOKEN_LOCALE)}). ` +
     "Continue running your in-progress task immediately from where you left off without pausing or asking to continue. " +
     "Only stop if the original request was already completely finished before compaction."
+  );
+}
+
+const YIELD_RESUME_REASON_CLAUSES: Readonly<Record<YieldResumeReason, string>> =
+  {
+    [YIELD_RESUME_REASON_NO_USAGE]: "current context usage is unavailable",
+    [YIELD_RESUME_REASON_DISABLED]:
+      "auto-compaction was disabled while yielding",
+    [YIELD_RESUME_REASON_BELOW_THRESHOLD]:
+      "context usage is now below the configured auto-compact cap",
+    [YIELD_RESUME_REASON_MAX_CONSECUTIVE]:
+      "the consecutive automatic compaction safety limit for this prompt was reached",
+  };
+
+/**
+ * Resumes an agent that paused for auto-compaction when compaction is skipped
+ * so a plugin-initiated pause never leaves active work stopped and the model
+ * receives the accurate reason for skipping compaction.
+ */
+export function buildYieldResumeWithoutCompactPrompt(
+  reason: YieldResumeReason,
+): string {
+  return (
+    `${AUTO_COMPACT_MESSAGE_PREFIX}Context compaction was skipped because ` +
+    `${YIELD_RESUME_REASON_CLAUSES[reason]}. ` +
+    "Continue running your in-progress task immediately from where you left off without pausing or asking to continue. " +
+    "Only stop if the original request was already completely finished before pausing."
   );
 }

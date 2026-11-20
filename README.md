@@ -50,7 +50,8 @@ bb plugin build . && bb plugin reload agy
   `bb.pluginId === "agy"`, and attaches quota RPCs and auto-compaction.
 - **`src/auto-compact.ts`, `src/auto-compact-client.ts`,
   `src/auto-compact-state.ts`, `src/auto-compact-policy.ts`,
-  `src/auto-compact-events.ts`**: Defines auto-compaction settings, inspects
+  `src/auto-compact-events.ts`, `src/auto-compact-registration.ts`,
+  `src/auto-compact-journal.ts`**: Defines auto-compaction settings, inspects
   event boundaries, yields active turns safely between tool calls to compact and
   immediately resume, and compacts idle threads in place.
 - **`app.tsx`, `src/icon-spec.ts`, `icons/*.svg`**: Mounts the multicolor SVG on
@@ -79,6 +80,12 @@ monitors reported token usage on `agy` threads and triggers compaction once
   or pauses.
 - **Idle turns:** If a turn completes above the threshold on its own, compaction
   runs in place on the idle thread without restarting `agy`.
+- **Plugin reloads:** A local SQLite journal records thread IDs, turn sequences,
+  and compaction counts. At startup the plugin checks unfinished yields against
+  the thread history and resumes work if the steered turn completed cleanly.
+  If bb loses the acknowledgement for a continuation, the plugin treats the
+  send as attempted to prevent duplicate work. Check the thread history before
+  resuming manually in that case.
 
 Configure under **Settings -> Installed plugins -> Antigravity** or via CLI:
 

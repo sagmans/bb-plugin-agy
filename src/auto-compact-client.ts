@@ -18,8 +18,10 @@ import {
   autoCompactThresholdSchema,
   buildMidTurnYieldPrompt,
   buildPostCompactionResumePrompt,
+  buildYieldResumeWithoutCompactPrompt,
   type ContextUsageSnapshot,
   contextUsageSchema,
+  type YieldResumeReason,
 } from "./auto-compact-policy.ts";
 import {
   AUTO_COMPACT_AGENT_ONLY_VISIBILITY,
@@ -43,6 +45,8 @@ import {
 
 const TRIGGER_IDLE_OPERATION = "auto-compact.trigger" as const;
 const TRIGGER_CONTINUE_OPERATION = "auto-compact.trigger-and-continue" as const;
+const RESUME_WITHOUT_COMPACT_OPERATION =
+  "auto-compact.resume-without-compact" as const;
 const MID_TURN_YIELD_OPERATION = "auto-compact.mid-turn-yield" as const;
 const CANCEL_QUEUED_OPERATION = "auto-compact.cancel-queued" as const;
 const YIELD_CANCELLED_OPERATION = "auto-compact.yield-cancelled" as const;
@@ -200,13 +204,10 @@ export class AutoCompactSdkClient {
         AUTO_COMPACT_READ_TIMEOUT_MS,
       );
     } catch (error) {
-      if (this.lifecycleSignal.aborted) {
-        return;
-      }
-      this.bb.log.warn(
+      throw new Error(
         `op=${CANCEL_QUEUED_OPERATION} sourceOp=${sourceOperation} ` +
-          `threadId=${threadId} queuedMessageId=${queuedMessageId} ` +
-          `cause=${error instanceof Error ? error.message : String(error)}`,
+          `threadId=${threadId} queuedMessageId=${queuedMessageId}`,
+        { cause: error },
       );
     }
   }
@@ -331,6 +332,36 @@ export class AutoCompactSdkClient {
   }
 
   /**
+   * Sends an agent-only control prompt that must execute immediately, cancelling
+   * unexpected queued delivery so deferred waits cannot hijack later turns.
+   */
+  private async sendImmediateAgentOnlyMessage(options: {
+    readonly threadId: string;
+    readonly mode: typeof STEER_SEND_MODE | typeof START_SEND_MODE;
+    readonly text: string;
+    readonly operation: string;
+  }): Promise<boolean> {
+    const response = await this.sendAgentOnlyMessage({
+      ...options,
+      timeoutMs: AUTO_COMPACT_REQUEST_TIMEOUT_MS,
+    });
+    if (response.delivery === DELIVERY_SENT) {
+      return true;
+    }
+    this.bb.log.warn(
+      `op=${options.operation} threadId=${options.threadId} ` +
+        `providerId=${PROVIDER_ID} delivery=${response.delivery} ` +
+        `queuedMessageId=${response.queuedMessage.id}`,
+    );
+    await this.cancelQueuedControlMessage(
+      options.threadId,
+      response.queuedMessage.id,
+      options.operation,
+    );
+    return false;
+  }
+
+  /**
    * Steers an active turn with an agent-only pause instruction; cancels and
    * fails closed if BB queues the steer so an idle thread is never paused later.
    */
@@ -345,27 +376,12 @@ export class AutoCompactSdkClient {
         `turnSeq=${turnSeq} usedTokens=${usage.usedTokens} ` +
         `threshold=${threshold} modelContextWindow=${usage.modelContextWindow}`,
     );
-    const response = await this.sendAgentOnlyMessage({
+    return this.sendImmediateAgentOnlyMessage({
       threadId,
       mode: STEER_SEND_MODE,
       text: buildMidTurnYieldPrompt(usage.usedTokens, threshold),
       operation: MID_TURN_YIELD_OPERATION,
-      timeoutMs: AUTO_COMPACT_REQUEST_TIMEOUT_MS,
     });
-    if (response.delivery === DELIVERY_SENT) {
-      return true;
-    }
-    this.bb.log.warn(
-      `op=${MID_TURN_YIELD_OPERATION} threadId=${threadId} ` +
-        `providerId=${PROVIDER_ID} delivery=${response.delivery} ` +
-        `queuedMessageId=${response.queuedMessage.id}`,
-    );
-    await this.cancelQueuedControlMessage(
-      threadId,
-      response.queuedMessage.id,
-      MID_TURN_YIELD_OPERATION,
-    );
-    return false;
   }
 
   /**
@@ -390,6 +406,27 @@ export class AutoCompactSdkClient {
       text: buildPostCompactionResumePrompt(usage.usedTokens, threshold),
       operation: TRIGGER_CONTINUE_OPERATION,
       timeoutMs: AUTO_COMPACT_COMPACT_TIMEOUT_MS,
+    });
+  }
+
+  /**
+   * Resumes a thread that yielded to this plugin when compaction is skipped so
+   * a plugin-initiated pause never leaves an active session stopped; returns
+   * whether the resume delivered immediately without queueing.
+   */
+  async sendResumeWithoutCompact(
+    threadId: string,
+    reason: YieldResumeReason,
+  ): Promise<boolean> {
+    this.bb.log.info(
+      `op=${RESUME_WITHOUT_COMPACT_OPERATION} threadId=${threadId} ` +
+        `providerId=${PROVIDER_ID} reason=${reason}`,
+    );
+    return this.sendImmediateAgentOnlyMessage({
+      threadId,
+      mode: START_SEND_MODE,
+      text: buildYieldResumeWithoutCompactPrompt(reason),
+      operation: RESUME_WITHOUT_COMPACT_OPERATION,
     });
   }
 

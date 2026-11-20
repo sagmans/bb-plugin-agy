@@ -4,7 +4,10 @@
  */
 
 import type { RecentThreadActivity } from "./auto-compact-events.ts";
-import type { ContextUsageSnapshot } from "./auto-compact-policy.ts";
+import type {
+  AutoCompactJournal,
+  JournalState,
+} from "./auto-compact-journal.ts";
 import {
   AUTO_COMPACT_MAX_TRACKED_THREADS,
   AUTO_COMPACT_YIELD_TIMEOUT_MS,
@@ -17,7 +20,6 @@ const ONE_COUNT = 1 as const;
 export interface PendingMidTurnYield {
   readonly steerSeq: number;
   readonly startedAtMs: number;
-  readonly usage: ContextUsageSnapshot;
 }
 
 /** Mutable per-thread state reconciled against persisted event watermarks. */
@@ -76,10 +78,43 @@ export function syncStateWithActivity(
 export class ThreadAutoCompactStore {
   private readonly maxTrackedThreads: number;
   private readonly states = new Map<string, ThreadAutoCompactState>();
+  private readonly journal?: AutoCompactJournal;
 
   // Explicit field assignment keeps Node native type stripping compatible.
-  constructor(maxTrackedThreads: number = AUTO_COMPACT_MAX_TRACKED_THREADS) {
+  constructor(
+    maxTrackedThreads: number = AUTO_COMPACT_MAX_TRACKED_THREADS,
+    journal?: AutoCompactJournal,
+  ) {
     this.maxTrackedThreads = maxTrackedThreads;
+    this.journal = journal;
+  }
+
+  /** Persists only settlement watermarks so reloads keep prompt budgets and unfinished yields. */
+  checkpoint(
+    threadId: string,
+    state: ThreadAutoCompactState,
+    changes: Partial<JournalState> = {},
+  ): void {
+    this.journal?.save(threadId, { ...state, ...changes });
+    Object.assign(state, changes);
+  }
+
+  /** Retires a finished yield so a rejected or interrupted turn is not replayed at each startup. */
+  settleAttempt(
+    threadId: string,
+    state: ThreadAutoCompactState,
+    turnSeq: number | null,
+    changes: Partial<JournalState> = {},
+  ): void {
+    if (turnSeq !== null && this.peek(threadId) === state) {
+      this.checkpoint(threadId, state, {
+        ...changes,
+        lastAttemptedIdleTurnSeq: Math.max(
+          state.lastAttemptedIdleTurnSeq ?? ZERO_COUNT,
+          turnSeq,
+        ),
+      });
+    }
   }
 
   /** Inspects existing state without allocating or changing LRU order. */
@@ -134,6 +169,7 @@ export class ThreadAutoCompactStore {
   /** Re-arms compaction once observed usage drops below the configured threshold. */
   clearAwaitingDrop(threadId: string): void {
     const state = this.peek(threadId);
+    this.journal?.clearAwaitingDrop(threadId);
     if (state !== null) {
       state.awaitingDropOrNewTurn = false;
     }
@@ -154,13 +190,17 @@ export class ThreadAutoCompactStore {
         this.states.delete(oldest);
       }
     }
-    const created = createInitialThreadState();
+    const created = Object.assign(
+      createInitialThreadState(),
+      this.journal?.read(threadId),
+    );
     this.states.set(threadId, created);
     return created;
   }
 
   /** Drops state when a thread is archived or deleted. */
   delete(threadId: string): void {
+    this.journal?.delete(threadId);
     this.states.delete(threadId);
   }
 

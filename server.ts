@@ -7,7 +7,7 @@
  */
 
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { registerAutoCompaction } from "./src/auto-compact.ts";
+import { registerAutoCompaction } from "./src/auto-compact-registration.ts";
 import {
   ACP_DIALECT_ID,
   ACP_PROVIDER_FAMILY,

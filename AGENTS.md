@@ -21,7 +21,7 @@ bb loads three bundles from `package.json` → `bb`:
 | `src/dialect.ts` | host daemon | Fail-closed `readAccount` health probe and unsettled-probe cache coalescing |
 | `src/usage.ts`, `src/usage-exec.ts` | host daemon | Portable streaming `agy -p /usage`, early OAuth stop, `AgyUsageFailureKind`, bucket normalization |
 | `src/usage-source.ts`, `src/usage-rpc-contract.ts` | bb server | `provider-usage.v1` RPC schema, label mapping, 60 s passive cache, `refresh` queuing |
-| `src/auto-compact*.ts` | bb server | Event-window analysis (`-events`), pure policy (`-policy`), LRU state (`-state`), SDK transport (`-client`), coordinator |
+| `src/auto-compact*.ts` | bb server | Event analysis, policy, LRU state, SQLite journal, startup recovery, SDK transport, coordinator |
 | `skills/agy-provider/SKILL.md` | bb skill loader | Provider and auto-compaction configuration reference for sessions |
 
 Do not put magic literals inline. Define shared constants in `src/constants.ts`
